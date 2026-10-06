@@ -1,0 +1,40 @@
+[server]
+enableStaticServing = true
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "dark"
+primaryColor = "#F2C14E"
+backgroundColor = "#111926"
+secondaryBackgroundColor = "#1B2536"
+textColor = "#F3ECDD"
+linkColor = "#F2C14E"
+borderColor = "#2A3548"
+baseRadius = "14px"
+buttonRadius = "full"
+font = "DM Sans, sans-serif"
+headingFont = "Fraunces, serif"
+headingFontWeights = [600, 600, 600, 600, 600, 600]
+
+[[theme.fontFaces]]
+family = "DM Sans"
+url = "app/static/dm-sans.woff2"
+weight = "100 1000"
+
+[[theme.fontFaces]]
+family = "Fraunces"
+url = "app/static/fraunces.woff2"
+weight = "100 900"
+
+[[theme.fontFaces]]
+family = "Fraunces"
+url = "app/static/fraunces-italic.woff2"
+weight = "100 900"
+style = "italic"
+
+[[theme.fontFaces]]
+family = "Bebas Neue"
+url = "app/static/bebas-neue.woff2"
+weight = 400
