@@ -831,10 +831,14 @@ SWIPE_CSS = """
   text-shadow: 0 0 30px rgba(242,193,78,.35); }
 .im-t em { color: var(--gold); font-weight: 400; }
 .im-n { color: var(--muted); font-size: .92rem; }
+.or { display: flex; align-items: center; gap: .8rem; margin: 1.4rem 0 .2rem; color: var(--muted);
+  font-family: var(--label); letter-spacing: .2em; font-size: .9rem; }
+.or:before, .or:after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.how-n { color: var(--muted); font-size: .8rem; margin: -.3rem 0 .2rem; }
 .how { display: grid; gap: 8px; margin: .8rem 0 1.1rem; }
 .how div { display: flex; gap: .8rem; align-items: center; border-radius: 14px; padding: .75rem .9rem;
   background: rgba(27,37,54,.75); box-shadow: inset 0 0 0 1px var(--line); font-size: .9rem; line-height: 1.4; }
-.how b { flex: 0 0 1.9rem; height: 1.9rem; border-radius: 50%; display: grid; place-items: center; font-family: var(--label);
+.how > div > b { flex: 0 0 1.9rem; height: 1.9rem; border-radius: 50%; display: grid; place-items: center; font-family: var(--label);
   font-size: 1.05rem; font-weight: 400; background: rgba(242,193,78,.15); color: var(--gold); padding-top: .1rem; }
 @media (prefers-reduced-motion: reduce) { .sw-card.top, .its-match, .live { animation: none !important; } }
 </style>
@@ -982,18 +986,31 @@ def code_card(code, text):
 
 
 def join_box():
-    section("Got a code?", kicker="Joining someone",
-            note="If the other person already started on their phone, enter their code here.")
+    md('<div class="or"><span>or</span></div>')
     c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
-    c1.text_input("Code", key="join_code", max_chars=4, placeholder="ABCD")
+    c1.text_input("Have a code?", key="join_code", max_chars=4, placeholder="ABCD")
     c2.button("Join", width="stretch", on_click=join_room)
     if st.session_state.get("join_error"):
         st.caption(st.session_state.join_error)
 
 
-UPLOAD_HELP = ("On letterboxd.com (not the app) go to Settings → Data → Export your data, then upload "
-               "the .zip. If it got unzipped, pick watched.csv, ratings.csv and watchlist.csv instead.")
-NAME_HINT = "Name (optional, otherwise we use Letterboxd's)"
+UPLOAD_HELP = ("On letterboxd.com (not the phone app) go to Settings → Data → Export your data. "
+               "Upload the .zip, or the watched, ratings and watchlist CSVs inside it.")
+NAME_HELP = "Leave blank to use the name on your Letterboxd profile."
+NAME_HINT = "Optional"
+
+
+def how_it_works(pairing=True):
+    with st.expander("How it works"):
+        steps = [
+            "Export your data on letterboxd.com: Settings → Data → Export your data. "
+            "It's not available in the phone app.",
+            ("One of you uploads theirs and gets a pair code. The other enters the code (or opens the link) "
+             "and uploads theirs." if pairing else "Upload both exports here."),
+            "Then pick a film at random, swipe to match, see your taste match, and find films to show each other.",
+        ]
+        md('<div class="how">' + "".join(f"<div><b>{i}</b><span>{t}</span></div>" for i, t in enumerate(steps, 1)) + "</div>"
+           '<div class="how-n">Uploads stay in the app\'s memory for up to 12 hours and are never saved to disk.</div>')
 
 header = st.container()
 have_both = all(st.session_state.get(k) for k in ("file_a", "file_b"))
@@ -1038,11 +1055,11 @@ if not paired and st.session_state.get("pair_join"):
         note("<b>That code has expired.</b> Ask for a new one.")
         st.button("Back", on_click=unpair)
     elif room["slots"][1] is None:
-        note(f"<b>{esc(room['slots'][0]['name'])} wants to pair up.</b> Add your own Letterboxd export and "
-             "you'll both get the full app on your own phones.")
-        st.caption(UPLOAD_HELP)
-        st.text_input("Your name", key="pj_name", placeholder=NAME_HINT)
-        st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="pj_file")
+        note(f"<b>{esc(room['slots'][0]['name'])} wants to pair up.</b> Add your Letterboxd export to join.")
+        how_it_works()
+        st.text_input("Your name", key="pj_name", placeholder=NAME_HINT, help=NAME_HELP)
+        st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="pj_file",
+                         help=UPLOAD_HELP)
         st.button("Pair up", type="primary", width="stretch", on_click=finish_pair, args=(jc,),
                   disabled=not st.session_state.get("pj_file"))
         if st.session_state.get("pj_error"):
@@ -1085,16 +1102,12 @@ else:
     if not have_both:
         with header:
             marquee("Now showing", "Double <em>Feature</em>", "Two Letterboxd accounts<i>✦</i>One movie night")
-            note("<b>Here's the plan.</b> Add both of your Letterboxd exports and you'll get a film to watch "
-                 "tonight, a taste-match score, a swipe-to-match game and a list of what to show each other.")
+            how_it_works(pairing=mode == "own")
 
     if mode == "own":
-        section("Start here", kicker="Each on your own phone", first=True,
-                note="Upload your own export and you'll get a code to send to the other person. "
-                     "Nobody needs to log in to anyone else's Letterboxd.")
-        st.caption(UPLOAD_HELP)
-        st.text_input("Your name", key="sp_name", placeholder=NAME_HINT)
-        st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="sp_file")
+        st.text_input("Your name", key="sp_name", placeholder=NAME_HINT, help=NAME_HELP)
+        st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="sp_file",
+                         help=UPLOAD_HELP)
         st.button("Get a pair code", type="primary", width="stretch", on_click=start_pair,
                   disabled=not st.session_state.get("sp_file"))
         if st.session_state.get("sp_error"):
@@ -1103,14 +1116,13 @@ else:
         st.stop()
 
     with st.expander("Your Letterboxd exports", expanded=not have_both):
-        st.caption(UPLOAD_HELP + " Files stay in this session and aren't saved.")
-        name_a = st.text_input("First person", placeholder=NAME_HINT)
+        name_a = st.text_input("First person's name", placeholder=NAME_HINT, help=NAME_HELP)
         file_a = st.file_uploader("First person's export", type=["zip", "csv"],
-                                  accept_multiple_files=True, key="file_a")
+                                  accept_multiple_files=True, key="file_a", help=UPLOAD_HELP)
         st.divider()
-        name_b = st.text_input("Second person", placeholder=NAME_HINT)
+        name_b = st.text_input("Second person's name", placeholder=NAME_HINT, help=NAME_HELP)
         file_b = st.file_uploader("Second person's export", type=["zip", "csv"],
-                                  accept_multiple_files=True, key="file_b")
+                                  accept_multiple_files=True, key="file_b", help=UPLOAD_HELP)
     if not (file_a and file_b):
         join_box()
         st.stop()
