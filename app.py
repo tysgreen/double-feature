@@ -3,9 +3,13 @@
 import html
 import io
 import random
+import re
+import secrets
 import string
 import threading
 import time
+import unicodedata
+import urllib.parse
 import zipfile
 import zlib
 
@@ -46,7 +50,8 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop_duplicates("key", keep="last")
 
 
-@st.cache_data(show_spinner=False)
+# Parsed exports are cached so tab switches are instant, but capped so a busy day can't fill memory
+@st.cache_data(show_spinner=False, max_entries=100, ttl=12 * 3600)
 def load_export(raw: bytes) -> dict:
     z = zipfile.ZipFile(io.BytesIO(raw))
     out = {"found": 0}
@@ -510,6 +515,7 @@ def ticket(k, name, year, uri, why_html: str, kicker: str = "Tonight's feature",
 # Nothing personal is stored: just the two display names, the film list and the yes/no votes.
 
 ROOM_TTL = 12 * 3600
+MAX_ROOMS = 300
 CODE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 DECK_MAX = 60
 
@@ -532,6 +538,9 @@ def _new_code(store) -> str:
     """Clear out expired rooms and return an unused 4-letter code. Call with the lock held."""
     now = time.time()
     for c in [c for c, r in store["rooms"].items() if now - r["created"] > ROOM_TTL]:
+        del store["rooms"][c]
+    # Hard cap: if there are ever more than MAX_ROOMS live, drop the oldest
+    for c in sorted(store["rooms"], key=lambda c: store["rooms"][c]["created"])[:-MAX_ROOMS or None]:
         del store["rooms"][c]
     code = "".join(random.choices(CODE_LETTERS, k=4))
     while code in store["rooms"]:
@@ -848,19 +857,48 @@ md(SWIPE_CSS)
 
 # ---------- Uploads (or joining someone else's swipe session) ----------
 
+KEEP = {  # the only parts of an export the app ever reads
+    "watched.csv": ["Name", "Year", "Letterboxd URI"],
+    "ratings.csv": ["Name", "Year", "Letterboxd URI", "Rating"],
+    "watchlist.csv": ["Name", "Year", "Letterboxd URI"],
+    "profile.csv": ["Username", "Given Name"],
+}
+
+
 def bundle(files):
-    """Turn an upload into zip bytes: the export zip itself, or loose CSVs from an unzipped export."""
+    """Turn an upload into a slimmed-down zip holding only what the app uses.
+
+    Accepts the export zip itself or loose CSVs from an unzipped export. Everything else in the
+    export (email address, reviews, comments, diary notes, etc.) is dropped here, straight after upload.
+    """
     files = files or []
-    for f in files:
-        if f.name.lower().endswith(".zip"):
-            return f.getvalue()
-    csvs = [f for f in files if f.name.lower().endswith(".csv")]
-    if not csvs:
+    src = {}
+    zips = [f for f in files if f.name.lower().endswith(".zip")]
+    try:
+        if zips:
+            z = zipfile.ZipFile(io.BytesIO(zips[0].getvalue()))
+            for name in KEEP:
+                path = _find(z, name)
+                if path:
+                    src[name] = z.read(path)
+        else:
+            for f in files:
+                name = f.name.rsplit("/", 1)[-1].lower()
+                if name in KEEP:
+                    src[name] = f.getvalue()
+    except zipfile.BadZipFile:
+        return None
+    if not src:
         return None
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        for f in csvs:
-            z.writestr(f.name.rsplit("/", 1)[-1].lower(), f.getvalue())
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as out:
+        for name, data in src.items():
+            try:
+                df = pd.read_csv(io.BytesIO(data), dtype=str)
+            except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError):
+                continue
+            df = df[[c for c in KEEP[name] if c in df.columns]]
+            out.writestr(name, df.to_csv(index=False))
     return buf.getvalue()
 
 
@@ -943,6 +981,8 @@ def route_code(code: str) -> str:
         return f"No session called {code or '…'}. Check the code on the other phone."
     if room["kind"] == "pair":
         st.session_state.pair_join = code
+    elif room["kind"] == "group":
+        st.session_state.group_join = code
     else:
         st.session_state.room = code
     return ""
@@ -977,9 +1017,9 @@ def pair_pulse(code, seen):
         st.rerun(scope="app")
 
 
-def code_card(code, text):
+def code_card(code, text, label="Pair code"):
     link = f"{st.context.url.split('?')[0]}?room={code}" if st.context.url else ""
-    md(f'<div class="room"><div class="room-k">Pair code</div><div class="room-code">{code}</div>'
+    md(f'<div class="room"><div class="room-k">{label}</div><div class="room-code">{code}</div>'
        f'<div class="room-n">{text}</div></div>')
     if link:
         st.code(link, language=None)
@@ -1000,9 +1040,14 @@ NAME_HELP = "Leave blank to use the name on your Letterboxd profile."
 NAME_HINT = "Optional"
 
 
-def how_it_works(pairing=True):
+def how_it_works(pairing=True, group=False):
     with st.expander("How it works"):
         steps = [
+            "The host starts a movie night and shares the code or link.",
+            "Everyone joins on their own phone and brings 5–10 films: make a Letterboxd list, then upload your "
+            "Letterboxd export (Settings → Data → Export your data) and pick that list.",
+            "Everyone swipes. The film most people want wins, and you get a shortlist of the top five.",
+        ] if group else [
             "Export your data on letterboxd.com: Settings → Data → Export your data. "
             "It's not available in the phone app.",
             ("One of you uploads theirs and gets a pair code. The other enters the code (or opens the link) "
@@ -1012,6 +1057,447 @@ def how_it_works(pairing=True):
         md('<div class="how">' + "".join(f"<div><b>{i}</b><span>{t}</span></div>" for i, t in enumerate(steps, 1)) + "</div>"
            '<div class="how-n">Uploads stay in the app\'s memory for up to 12 hours and are never saved to disk.</div>')
 
+# ---------- Group movie night: everyone brings films, everyone swipes, the most-wanted film wins ----------
+# A group room holds the guest list, the films each person brought, and yes/no votes, in server memory.
+
+GROUP_MAX_FILMS = 20   # per person
+GROUP_UPLOAD_HELP = ("Make a list of the films you'd watch tonight on Letterboxd, then export your data from "
+                     "letterboxd.com → Settings → Data (after making the list). Upload the .zip and pick the list, "
+                     "or upload just that list's CSV.")
+GROUP_MAX_PEOPLE = 16
+
+
+def _norm_year(y):
+    y = pd.to_numeric(y, errors="coerce")
+    return None if pd.isna(y) else int(y)
+
+
+def title_key(name: str) -> str:
+    """Forgiving title match: ignore case, accents, punctuation and '&' vs 'and'."""
+    t = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode().casefold()
+    t = re.sub(r"[^a-z0-9]+", " ", t.replace("&", " and "))
+    return " ".join(t.split())
+
+
+def film_entry(name, year=None, uri=None):
+    name = str(name).strip()
+    year = _norm_year(year)
+    key = f"{title_key(name) or name.casefold()}|{year if year is not None else '<NA>'}"
+    if not uri or (isinstance(uri, float) and pd.isna(uri)):
+        uri = f"https://letterboxd.com/search/films/{urllib.parse.quote(name)}/"
+    return {"key": key, "name": name, "year": str(year or ""), "uri": str(uri)}
+
+
+def parse_list_csv(data: bytes):
+    """Read a Letterboxd list CSV (or any CSV with Name and Year columns), skipping the list's header block."""
+    text = data.decode("utf-8-sig", errors="replace")
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines)
+                  if {"name", "year"} <= {c.strip().strip('"').lower() for c in l.split(",")}), None)
+    if start is None:
+        return []
+    try:
+        df = pd.read_csv(io.StringIO("\n".join(lines[start:])), dtype=str)
+    except (pd.errors.ParserError, pd.errors.EmptyDataError):
+        return []
+    if "Name" not in df.columns:
+        return []
+    uri_col = next((c for c in ("Letterboxd URI", "URL") if c in df.columns), None)
+    return [film_entry(r["Name"], r.get("Year"), r.get(uri_col) if uri_col else None)
+            for _, r in df.dropna(subset=["Name"]).iterrows()]
+
+
+def lists_in_export(raw: bytes):
+    """From a full Letterboxd export zip: {display name: films} for each list, plus the watchlist."""
+    out = {}
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        return out
+    skip = {"deleted", "orphaned", "likes"}
+    for n in sorted(z.namelist()):
+        parts = n.split("/")
+        if n.lower().endswith(".csv") and "lists" in parts[:-1] and not skip.intersection(parts[:-1]):
+            films = parse_list_csv(z.read(n))
+            if films:
+                out[parts[-1][:-4].replace("-", " ").strip().capitalize()] = films
+    wl = _find(z, "watchlist.csv")
+    if wl:
+        films = parse_list_csv(z.read(wl))
+        if films:
+            out["My watchlist"] = films
+    return out
+
+
+def create_group(host_name) -> tuple:
+    store = _room_store()
+    with store["lock"]:
+        code = _new_code(store)
+        mid = secrets.token_hex(4)
+        store["rooms"][code] = {"code": code, "kind": "group", "created": time.time(), "host": mid,
+                                "members": {mid: {"name": host_name, "films": []}}, "films": {},
+                                "phase": "lobby", "deck": [], "votes": {}, "round": 1}
+    return code, mid
+
+
+def group_state(room):
+    """Changes here reload every phone in the group (phase changes and new rounds)."""
+    return (room["phase"], room["round"])
+
+
+def add_member(code, name):
+    store = _room_store()
+    with store["lock"]:
+        room = get_room(code)
+        if not room or len(room["members"]) >= GROUP_MAX_PEOPLE:
+            return None
+        taken = {m["name"].casefold() for m in room["members"].values()}
+        base, n = name, 2
+        while name.casefold() in taken:
+            name, n = f"{base} {n}", n + 1
+        mid = secrets.token_hex(4)
+        room["members"][mid] = {"name": name, "films": []}
+        if room["phase"] == "voting":
+            room["votes"][mid] = {}
+        return mid
+
+
+def set_films(code, mid, films):
+    store = _room_store()
+    with store["lock"]:
+        room = get_room(code)
+        if not room or mid not in room["members"] or room["phase"] != "lobby":
+            return
+        me_ = room["members"][mid]
+        for f in me_["films"]:  # replace this person's previous picks
+            entry = room["films"].get(f)
+            if entry:
+                entry["by"] = [b for b in entry["by"] if b != mid]
+                if not entry["by"]:
+                    del room["films"][f]
+        me_["films"] = []
+        for f in films[:GROUP_MAX_FILMS]:
+            title = f["key"].split("|")[0]
+            if f["key"].endswith("|<NA>"):  # typed without a year: match a film someone else brought
+                same = [k for k in room["films"] if k.split("|")[0] == title]
+                if same:
+                    f = room["films"][same[0]]
+            elif f"{title}|<NA>" in room["films"]:  # someone typed this one without a year: upgrade it
+                old = room["films"].pop(f"{title}|<NA>")
+                room["films"][f["key"]] = {**f, "by": old["by"]}
+                for m in room["members"].values():
+                    m["films"] = [f["key"] if k == old["key"] else k for k in m["films"]]
+            entry = room["films"].setdefault(f["key"], {**f, "by": []})
+            if mid not in entry["by"]:
+                entry["by"].append(mid)
+                me_["films"].append(f["key"])
+
+
+def start_group_vote(code, keys=None):
+    store = _room_store()
+    with store["lock"]:
+        room = get_room(code)
+        if not room:
+            return
+        deck = list(keys) if keys else list(room["films"])
+        random.Random(f"{code}{room['round']}").shuffle(deck)
+        room["deck"], room["phase"] = deck, "voting"
+        room["votes"] = {m: {} for m in room["members"]}
+        room["round"] += 1
+
+
+def end_group_vote(code):
+    with _room_store()["lock"]:
+        room = get_room(code)
+        if room and room["phase"] == "voting":
+            room["phase"] = "results"
+
+
+def back_to_lobby(code):
+    with _room_store()["lock"]:
+        room = get_room(code)
+        if room:
+            room["phase"], room["deck"], room["votes"] = "lobby", [], {}
+            room["round"] += 1
+
+
+def group_vote(code, mid):
+    v = (st.session_state.get(f"gdeck_{code}") or {}).get("swipe")
+    if not (v and v.get("key")):
+        return
+    with _room_store()["lock"]:
+        room = get_room(code)
+        if not room or room["phase"] != "voting" or v["key"] not in room["deck"]:
+            return
+        room["votes"].setdefault(mid, {})[v["key"]] = bool(v.get("like"))
+        voters = [m for m in room["votes"] if m in room["members"]]
+        if voters and all(len(room["votes"][m]) >= len(room["deck"]) for m in voters):
+            room["phase"] = "results"
+
+
+def tally(room):
+    """Rank films by yes votes, then fewest no votes. Returns [(key, yes, no)]."""
+    rows = []
+    for k in room["deck"]:
+        yes = sum(1 for v in room["votes"].values() if v.get(k) is True)
+        no = sum(1 for v in room["votes"].values() if v.get(k) is False)
+        rows.append((k, yes, no))
+    tie = random.Random(f"{room['code']}{room['round']}")
+    rows.sort(key=lambda r: (-r[1], r[2], tie.random()))
+    return rows
+
+
+def leave_group():
+    for k in ("group", "gid", "group_join"):
+        st.session_state.pop(k, None)
+    st.query_params.pop("room", None)
+
+
+def host_group():
+    name = st.session_state.get("gh_name", "").strip() or "Host"
+    code, mid = create_group(name)
+    st.session_state.group, st.session_state.gid = code, mid
+
+
+def join_group(code):
+    name = st.session_state.get("gj_name", "").strip()
+    if not name:
+        st.session_state.gj_error = "Add your name so everyone knows who's voting."
+        return
+    mid = add_member(code, name)
+    if not mid:
+        st.session_state.gj_error = "That movie night is full or has ended."
+        return
+    st.session_state.gj_error = ""
+    st.session_state.group, st.session_state.gid = code, mid
+    st.session_state.pop("group_join", None)
+
+
+def rejoin_group(code, mid):
+    st.session_state.group, st.session_state.gid = code, mid
+    st.session_state.pop("group_join", None)
+
+
+def save_my_films(code, mid, films):
+    set_films(code, mid, films)
+    st.session_state.gf_saved = True
+
+
+def by_names(room, entry):
+    names = [room["members"][m]["name"] for m in entry["by"] if m in room["members"]]
+    return "Brought by " + (", ".join(names) if names else "someone")
+
+
+@st.fragment(run_every=2)
+def group_pulse(code, mid, seen):
+    room = get_room(code)
+    if not room or group_state(room) != seen:
+        st.rerun(scope="app")
+    members = room["members"]
+    if room["phase"] == "lobby":
+        chips = "".join(
+            f'<div class="gm"><span class="gm-n">{esc(m["name"])}{" ★" if k == room["host"] else ""}</span>'
+            f'<span class="gm-c">{len(m["films"]) or "no"} film{"s" if len(m["films"]) != 1 else ""}</span></div>'
+            for k, m in members.items())
+        md(f'<div class="sec-k" style="margin-top:1.2rem">Who\'s coming · {len(members)}</div>'
+           f'<div class="gms">{chips}</div>')
+        n = len(room["films"])
+        if mid == room["host"]:
+            st.button(f"Start the vote · {n} films", type="primary", width="stretch", disabled=n < 2,
+                      on_click=start_group_vote, args=(code,), key="g_start")
+            if n < 2:
+                st.caption("You need at least two films in the pot to start.")
+        else:
+            host = members[room["host"]]["name"]
+            md(f'<div class="sw-status"><span class="live"></span>Waiting for&nbsp;<b>{esc(host)}</b>to start the vote'
+               f' · {n} films so far</div>')
+    elif room["phase"] == "voting":
+        total = len(room["deck"])
+        done = sum(1 for m in members if len(room["votes"].get(m, {})) >= total)
+        md(f'<div class="sw-status"><span class="live"></span><b>{done} of {len(members)}</b> finished voting</div>')
+
+
+def group_deck_html(room, todo):
+    def card(k, cls):
+        e = room["films"].get(k) or {"key": k, "name": k.split("|")[0], "year": "", "uri": "", "by": []}
+        return swipe_card({**e, "why": by_names(room, e)}, cls)
+    cards = card(todo[0], "top") + (card(todo[1], "next") if len(todo) > 1 else "")
+    return (f'<div class="sw-stack">{cards}</div><div class="sw-btns">'
+            f'<button class="sw-btn sw-no" aria-label="Pass">{ICON_X}</button>'
+            f'<button class="sw-btn sw-yes" aria-label="Watch">{ICON_HEART}</button></div>'
+            f'<div class="sw-hint">Swipe right if you\'d watch it tonight, left to pass</div>')
+
+
+def group_film_picker(code, mid, room):
+    """Let this person add their films: a list CSV, a full export (pick a list) or typed titles."""
+    mine = room["members"][mid]["films"]
+    if mine:
+        items = "".join(f'<div class="reel-item">{poster_html(k, room["films"][k]["name"], room["films"][k]["year"], None)}</div>'
+                        for k in mine if k in room["films"])
+        section("Your films", kicker=f"{len(mine)} in the pot", first=True)
+        md(f'<div class="reel">{items}</div>')
+        with st.expander("Change my films"):
+            group_film_form(code, mid)
+    else:
+        section("Add your films", kicker="Your picks", first=True,
+                note="Upload your Letterboxd export and pick the list you made for tonight.")
+        group_film_form(code, mid)
+
+
+def group_film_form(code, mid):
+    films = []
+    up = st.file_uploader("Your Letterboxd export", type=["zip", "csv"], key="gf_file", help=GROUP_UPLOAD_HELP)
+    if up is not None:
+        data = up.getvalue()
+        if up.name.lower().endswith(".zip"):
+            found = lists_in_export(data)
+            if not found:
+                st.caption("Couldn't find any lists in that export. Make a list on Letterboxd, then export again.")
+            else:
+                pick = st.selectbox("Which list?", list(found), key="gf_pick")
+                films = found.get(pick, [])
+        else:
+            films = parse_list_csv(data)
+            if not films:
+                st.caption("That file doesn't look like a Letterboxd list. Try uploading your full export instead.")
+    if films:
+        extra = f" (first {GROUP_MAX_FILMS} used)" if len(films) > GROUP_MAX_FILMS else ""
+        st.caption(f"{len(films)} films ready{extra}: " + ", ".join(f["name"] for f in films[:6])
+                   + ("…" if len(films) > 6 else ""))
+    st.button("Add to the pot", type="primary", width="stretch", disabled=not films,
+              on_click=save_my_films, args=(code, mid, films), key="gf_save")
+
+
+def group_view(code, mid):
+    room = get_room(code)
+    if not room or mid not in room["members"]:
+        with header:
+            marquee("Movie night", "Double <em>Feature</em>", "Group night")
+        note("<b>That movie night has ended.</b> They last 12 hours. Start a new one from the home screen.")
+        st.button("OK", on_click=leave_group)
+        return
+    me_ = room["members"][mid]
+    is_host = mid == room["host"]
+    host = room["members"][room["host"]]["name"]
+    with header:
+        marquee("Movie night", f"{esc(host)}'s <em>place</em>", f"Group night<i>✦</i>Room <b>{code}</b>")
+    seen = group_state(room)
+
+    if room["phase"] == "lobby":
+        if is_host:
+            code_card(code, "Send this link to everyone, or have them enter the code in Double Feature "
+                            "under Group night.", label="Room code")
+        group_pulse(code, mid, seen)
+        group_film_picker(code, mid, room)
+
+    elif room["phase"] == "voting":
+        group_pulse(code, mid, seen)
+        mine = room["votes"].get(mid, {})
+        todo = [k for k in room["deck"] if k not in mine]
+        if todo:
+            n = len(room["deck"])
+            md(f'<div class="sw-head"><span>Voting as <b>{esc(me_["name"])}</b></span>'
+               f'<span>{n - len(todo) + 1} / {n}</span></div>'
+               f'<div class="sw-prog"><i style="width:{100 * (n - len(todo)) / max(n, 1):.1f}%"></i></div>')
+            swiper(key=f"gdeck_{code}", data={"html": group_deck_html(room, todo)},
+                   on_swipe_change=lambda: group_vote(code, mid))
+        else:
+            note("<b>Your votes are in.</b> Results appear here as soon as everyone's finished.")
+        if is_host:
+            st.button("Close voting now", width="stretch", on_click=end_group_vote, args=(code,),
+                      help="Count the votes so far, even if some people haven't finished.")
+
+    else:  # results
+        group_pulse(code, mid, seen)
+        rows = tally(room)
+        voters = sum(1 for v in room["votes"].values() if v)
+        top_yes = rows[0][1] if rows else 0
+        tied = [k for k, y, _ in rows if y == top_yes] if top_yes else []
+        win = room["films"].get(rows[0][0]) if rows else None
+        if win and len(tied) == 1:
+            md(f'<div class="its-match"><div class="im-k">✦ The votes are in ✦</div>'
+               f'<div class="im-t">Tonight\'s <em>pick</em></div>'
+               f'<div class="im-n">{top_yes} of {voters} want to watch it</div></div>')
+            md(ticket(win["key"], win["name"], win["year"], win["uri"], esc(by_names(room, win)),
+                      kicker="Group favourite"))
+        elif tied:
+            md(f'<div class="its-match"><div class="im-k">✦ The votes are in ✦</div>'
+               f'<div class="im-t">It\'s a <em>tie</em></div>'
+               f'<div class="im-n">{len(tied)} films got {top_yes} yes vote{"s" if top_yes != 1 else ""} each</div></div>')
+        elif not voters:
+            note("<b>Voting closed before anyone voted.</b>")
+        else:
+            note("<b>Nobody said yes to anything.</b> Maybe add some different films and try again.")
+
+        shortlist = [r for r in rows if r[1]][:5]
+        if shortlist and top_yes:
+            section("The shortlist", kicker="Top films")
+            bars = []
+            for i, (k, y, n_) in enumerate(shortlist, 1):
+                e = room["films"][k]
+                pct = 100 * y / max(voters, 1)
+                bars.append(f'<div class="row">{poster_html(k, e["name"], e["year"], e["uri"], "sm")}'
+                            f'<div class="row-body"><div class="row-t"><a href="{esc(e["uri"])}" target="_blank">'
+                            f'{esc(e["name"])}</a><span class="row-y">{esc(e["year"])}</span></div>'
+                            f'<div class="gbar"><i style="width:{pct:.0f}%"></i></div>'
+                            f'<div class="row-s">{esc(by_names(room, e))}</div></div>'
+                            f'<div class="row-m"><div class="vs-gap" style="color:var(--gold)">{y}'
+                            f'<small>of {voters}</small></div></div></div>')
+            md("".join(bars))
+        if is_host:
+            runoff = tied if len(tied) > 1 else [k for k, y, _ in rows[:3] if y]
+            if len(runoff) > 1:
+                st.button(f"Run-off: vote again on these {len(runoff)}", type="primary", width="stretch",
+                          on_click=start_group_vote, args=(code, runoff))
+            st.button("Back to the lobby to add films", width="stretch", on_click=back_to_lobby, args=(code,))
+        else:
+            st.caption(f"{host} can start a run-off or go back to add more films.")
+
+    st.button("Leave movie night", on_click=leave_group, key="g_leave")
+
+
+def group_join_screen(code):
+    room = get_room(code)
+    with header:
+        if room:
+            host = room["members"][room["host"]]["name"]
+            marquee("Movie night", f"{esc(host)}'s <em>place</em>", f"Room <b>{code}</b>")
+        else:
+            marquee("Movie night", "Double <em>Feature</em>", "Group night")
+    if not room:
+        note("<b>That movie night has ended.</b> Ask for a new code.")
+        st.button("Back", on_click=leave_group)
+        return
+    host = room["members"][room["host"]]["name"]
+    note(f"<b>{esc(host)} is hosting a movie night.</b> Add your name, bring some films, then everyone votes.")
+    st.text_input("Your name", key="gj_name", max_chars=24)
+    st.button("Join", type="primary", width="stretch", on_click=join_group, args=(code,), key="gj_go")
+    if st.session_state.get("gj_error"):
+        st.caption(st.session_state.gj_error)
+    others = [(k, m["name"]) for k, m in room["members"].items()]
+    if others:
+        with st.expander("Already joined on another phone?"):
+            cols = st.columns(2)
+            for i, (k, n) in enumerate(others):
+                cols[i % 2].button(n, key=f"grejoin_{k}", width="stretch", on_click=rejoin_group, args=(code, k))
+    st.button("Cancel", on_click=leave_group, key="gj_cancel")
+
+
+GROUP_CSS = """
+<style>
+.gms { display: flex; flex-wrap: wrap; gap: 6px; margin: .45rem 0 .9rem; }
+.gm { display: flex; align-items: baseline; gap: .45rem; padding: .4rem .75rem .35rem; border-radius: 999px;
+  background: rgba(27,37,54,.85); box-shadow: inset 0 0 0 1px var(--line); font-size: .88rem; }
+.gm-n { color: var(--cream); font-weight: 600; }
+.gm-c { color: var(--muted); font-size: .78rem; }
+.gbar { height: 5px; border-radius: 5px; background: rgba(243,236,221,.08); overflow: hidden; margin-top: .4rem; }
+.gbar i { display: block; height: 100%; background: linear-gradient(90deg, var(--gold), var(--sea)); }
+.reel-item .poster { width: 100%; }
+</style>
+"""
+md(GROUP_CSS)
+
+
 header = st.container()
 have_both = all(st.session_state.get(k) for k in ("file_a", "file_b"))
 
@@ -1019,8 +1505,16 @@ have_both = all(st.session_state.get(k) for k in ("file_a", "file_b"))
 qp = (st.query_params.get("room") or "").strip().upper()
 if qp and st.session_state.get("qp_handled") != qp:
     st.session_state.qp_handled = qp
-    if not st.session_state.get("pair"):
+    if not (st.session_state.get("pair") or st.session_state.get("group")):
         st.session_state.join_error = route_code(qp)
+
+# Group movie night takes over the whole screen
+if st.session_state.get("group"):
+    group_view(st.session_state.group, st.session_state.get("gid"))
+    st.stop()
+if st.session_state.get("group_join"):
+    group_join_screen(st.session_state.group_join)
+    st.stop()
 
 pair_code, me = st.session_state.get("pair"), st.session_state.get("me")
 pair = get_room(pair_code) if pair_code else None
@@ -1097,12 +1591,21 @@ if paired:
     pair_pulse(pair_code, pair_state(pair))
 else:
     mode = "one" if have_both else st.segmented_control(
-        "How are you doing this?", ["own", "one"], default="own", key="mode", label_visibility="collapsed",
-        format_func={"own": "Each on our own phone", "one": "Both on this phone"}.get) or "own"
+        "How are you doing this?", ["own", "one", "group"], default="own", key="mode",
+        label_visibility="collapsed",
+        format_func={"own": "Two phones", "one": "One phone", "group": "Group night"}.get) or "own"
     if not have_both:
         with header:
-            marquee("Now showing", "Double <em>Feature</em>", "Two Letterboxd accounts<i>✦</i>One movie night")
-            how_it_works(pairing=mode == "own")
+            marquee("Now showing", "Double <em>Feature</em>",
+                    "A whole group<i>✦</i>One movie night" if mode == "group"
+                    else "Two Letterboxd accounts<i>✦</i>One movie night")
+            how_it_works(pairing=mode == "own", group=mode == "group")
+
+    if mode == "group":
+        st.text_input("Your name", key="gh_name", max_chars=24, placeholder="So your friends know who's hosting")
+        st.button("Host a movie night", type="primary", width="stretch", on_click=host_group)
+        join_box()
+        st.stop()
 
     if mode == "own":
         st.text_input("Your name", key="sp_name", placeholder=NAME_HINT, help=NAME_HELP)
@@ -1128,10 +1631,14 @@ else:
         st.stop()
     raw_a, raw_b = bundle(file_a), bundle(file_b)
 
-try:
-    da, db = load_export(raw_a), load_export(raw_b)
-except (zipfile.BadZipFile, TypeError, pd.errors.ParserError):
-    da = db = None
+def safe_load(raw):
+    try:
+        return load_export(raw) if raw else None
+    except (zipfile.BadZipFile, pd.errors.ParserError, UnicodeDecodeError):
+        return None
+
+
+da, db = safe_load(raw_a), safe_load(raw_b)
 bad = [label for label, d in (("the first person", da), ("the second person", db)) if not d or not d["found"]]
 if bad:
     st.error(

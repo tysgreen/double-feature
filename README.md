@@ -4,7 +4,7 @@
 
 Double Feature compares two people's Letterboxd data and helps them pick something to watch together. It's built for phones and styled like an old movie palace.
 
-👉 **[Open the app](https://double-feature.streamlit.app/)**
+👉 **[Open the app](https://YOUR-APP-NAME.streamlit.app)**
 
 ![Double Feature on a phone: the Pick, Swipe, Taste and Stats tabs](preview.png)
 
@@ -19,6 +19,8 @@ Double Feature compares two people's Letterboxd data and helps them pick somethi
 | **Taste** | Your taste-match score, a chart of every film you've both rated, the films you both loved and your biggest disagreements. |
 | **Swaps** | Films one of you rated highly that the other hasn't seen yet. |
 | **Stats** | A head-to-head comparison: films logged, average rating, favourite decade and how you each hand out stars. |
+
+There's also a **Group night** mode for more than two people. Everyone brings a few films, everyone swipes, and the most-wanted film wins.
 
 ## How to use it
 
@@ -40,6 +42,15 @@ Go to **[letterboxd.com/settings/data](https://letterboxd.com/settings/data)** a
 
 Pick **Both on this phone** and upload both exports. You can still start a swipe session from the Swipe tab, and the other person joins it on their phone with the code.
 
+### Group night 🍿
+
+Hosting friends? Pick **Group night** on the start screen.
+
+1. The host taps **Host a movie night** and shares the code or link.
+2. Everyone joins on their own phone and brings 5–10 films. Make a Letterboxd list of what you'd watch, export your data (after making the list), then upload the export and pick that list. If two people bring the same film, it only shows up once.
+3. The host starts the vote and everyone swipes through the combined pile.
+4. The film the most people said yes to wins, and you get a shortlist of the top five. If it's a tie or you want to narrow it down, the host can run a quick run-off on the top few.
+
 ### Tips
 
 - If your export got unzipped, upload `watched.csv`, `ratings.csv` and `watchlist.csv` instead of the zip.
@@ -51,7 +62,7 @@ Pick **Both on this phone** and upload both exports. You can still start a swipe
 
 - Nothing is written to disk or stored in a database.
 - Uploads are held in the app's memory only for your session. When you pair or swipe across two phones, they're kept for up to 12 hours so the other phone can load them. Restarting the app clears everything.
-- The app only reads your watched films, ratings, watchlist and profile name.
+- Straight after upload, the app throws away everything except your watched films, ratings, watchlist and profile name. Your email address, reviews, comments and diary notes from the export are never kept.
 
 ## Running it locally
 
