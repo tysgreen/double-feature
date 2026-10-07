@@ -182,6 +182,7 @@ a { -webkit-tap-highlight-color: transparent; }
 [data-testid="stBaseButton-primary"] p { font-family: var(--label); font-size: 1.45rem !important;
   letter-spacing: .14em; color: var(--ink); padding-top: .15rem; }
 [data-testid="stBaseButton-primary"]:hover { filter: brightness(1.05); }
+[data-testid="stBaseButton-primary"]:disabled { opacity: .4; box-shadow: none; filter: saturate(.6); }
 [data-testid="stBaseButton-primary"]:active { transform: translateY(1px) scale(.995); }
 button[data-variant="pills"], button[data-variant="segmented_control"] { min-height: 2.4rem; }
 button[data-variant="pills"][aria-pressed="true"], button[data-variant="segmented_control"][aria-checked="true"] {
@@ -527,18 +528,24 @@ def get_room(code):
     return room
 
 
+def _new_code(store) -> str:
+    """Clear out expired rooms and return an unused 4-letter code. Call with the lock held."""
+    now = time.time()
+    for c in [c for c, r in store["rooms"].items() if now - r["created"] > ROOM_TTL]:
+        del store["rooms"][c]
+    code = "".join(random.choices(CODE_LETTERS, k=4))
+    while code in store["rooms"]:
+        code = "".join(random.choices(CODE_LETTERS, k=4))
+    return code
+
+
 def create_room(names, deck) -> str:
     store = _room_store()
     with store["lock"]:
-        now = time.time()
-        for c in [c for c, r in store["rooms"].items() if now - r["created"] > ROOM_TTL]:
-            del store["rooms"][c]
-        code = "".join(random.choices(CODE_LETTERS, k=4))
-        while code in store["rooms"]:
-            code = "".join(random.choices(CODE_LETTERS, k=4))
+        code = _new_code(store)
         random.Random(code).shuffle(deck)  # same order on both phones
         store["rooms"][code] = {
-            "code": code, "created": now, "names": list(names), "deck": deck[:DECK_MAX],
+            "code": code, "kind": "swipe", "created": time.time(), "names": list(names), "deck": deck[:DECK_MAX],
             "full_deck": deck[:DECK_MAX], "votes": {n: {} for n in names}, "joined": set(),
             "match": None, "passed": set(), "round": 1,
         }
@@ -853,22 +860,204 @@ def bundle(files):
     return buf.getvalue()
 
 
-def join_room():
-    code = st.session_state.get("join_code", "").strip().upper()
-    if get_room(code):
-        st.session_state.room = code
-        st.session_state.join_error = ""
-    else:
-        st.session_state.join_error = f"No swipe session called {code or '…'}. Check the code on the other phone."
+# ---------- Pairing: each person uploads their own export on their own phone ----------
+# A pair room holds both exports in server memory (never on disk) for up to 12 hours,
+# so either phone can load the full app. Swipe sessions started while paired live inside it.
 
+def create_pair(name, raw) -> str:
+    store = _room_store()
+    with store["lock"]:
+        code = _new_code(store)
+        store["rooms"][code] = {"code": code, "kind": "pair", "created": time.time(),
+                                "slots": [{"name": name, "raw": raw}, None], "swipe": None}
+    return code
+
+
+def pair_state(room):
+    """When this changes, the other phone reloads (partner arrived, swipe session started or ended)."""
+    return (all(room["slots"]), room["swipe"])
+
+
+def read_upload(files, typed_name: str, fallback: str):
+    """Validate one person's upload. Returns (raw, name) or (None, error message)."""
+    raw = bundle(files)
+    try:
+        d = load_export(raw) if raw else None
+    except (zipfile.BadZipFile, TypeError, pd.errors.ParserError):
+        d = None
+    if not d or not d["found"]:
+        return None, ("That doesn't look like a Letterboxd export. Upload the .zip from letterboxd.com → "
+                      "Settings → Data → Export your data, or the watched.csv, ratings.csv and watchlist.csv inside it.")
+    return raw, (typed_name.strip() or d["name"] or fallback)
+
+
+def start_pair():
+    raw, name = read_upload(st.session_state.get("sp_file"), st.session_state.get("sp_name", ""), "Person 1")
+    if raw is None:
+        st.session_state.sp_error = name
+        return
+    st.session_state.sp_error = ""
+    st.session_state.pair = create_pair(name, raw)
+    st.session_state.me = 0
+
+
+def finish_pair(code):
+    raw, name = read_upload(st.session_state.get("pj_file"), st.session_state.get("pj_name", ""), "Person 2")
+    if raw is None:
+        st.session_state.pj_error = name
+        return
+    store = _room_store()
+    with store["lock"]:
+        room = get_room(code)
+        if not room or room["slots"][1] is not None:
+            st.session_state.pj_error = "Someone has already paired with this code."
+            return
+        if name.casefold() == room["slots"][0]["name"].casefold():
+            name = f"{name} (2)"
+        room["slots"][1] = {"name": name, "raw": raw}
+    st.session_state.pj_error = ""
+    st.session_state.pair, st.session_state.me = code, 1
+    st.session_state.pop("pair_join", None)
+
+
+def rejoin_pair(code, i):
+    st.session_state.pair, st.session_state.me = code, i
+    st.session_state.pop("pair_join", None)
+
+
+def unpair():
+    for k in ("pair", "me", "pair_join", "seen_swipe", "room"):
+        st.session_state.pop(k, None)
+    st.query_params.pop("room", None)
+
+
+def route_code(code: str) -> str:
+    """Send a typed or linked code to the right place. Returns an error message, or ''."""
+    code = (code or "").strip().upper()
+    room = get_room(code)
+    if not room:
+        return f"No session called {code or '…'}. Check the code on the other phone."
+    if room["kind"] == "pair":
+        st.session_state.pair_join = code
+    else:
+        st.session_state.room = code
+    return ""
+
+
+def join_room():
+    st.session_state.join_error = route_code(st.session_state.get("join_code", ""))
+
+
+def start_pair_swipe(pair_code, names, deck, seat):
+    sc = create_room(names, deck)
+    store = _room_store()
+    with store["lock"]:
+        room = get_room(pair_code)
+        if room:
+            room["swipe"] = sc
+    st.session_state.seen_swipe = sc
+    choose_seat(sc, seat)
+
+
+def end_pair_swipe(pair_code):
+    with _room_store()["lock"]:
+        room = get_room(pair_code)
+        if room:
+            room["swipe"] = None
+
+
+@st.fragment(run_every=2)
+def pair_pulse(code, seen):
+    room = get_room(code)
+    if not room or pair_state(room) != seen:
+        st.rerun(scope="app")
+
+
+def code_card(code, text):
+    link = f"{st.context.url.split('?')[0]}?room={code}" if st.context.url else ""
+    md(f'<div class="room"><div class="room-k">Pair code</div><div class="room-code">{code}</div>'
+       f'<div class="room-n">{text}</div></div>')
+    if link:
+        st.code(link, language=None)
+
+
+def join_box():
+    section("Got a code?", kicker="Joining someone",
+            note="If the other person already started on their phone, enter their code here.")
+    c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
+    c1.text_input("Code", key="join_code", max_chars=4, placeholder="ABCD")
+    c2.button("Join", width="stretch", on_click=join_room)
+    if st.session_state.get("join_error"):
+        st.caption(st.session_state.join_error)
+
+
+UPLOAD_HELP = ("On letterboxd.com (not the app) go to Settings → Data → Export your data, then upload "
+               "the .zip. If it got unzipped, pick watched.csv, ratings.csv and watchlist.csv instead.")
+NAME_HINT = "Name (optional, otherwise we use Letterboxd's)"
 
 header = st.container()
 have_both = all(st.session_state.get(k) for k in ("file_a", "file_b"))
 
-# Arriving with a room link, or after entering a code, on a phone with no exports loaded
-if "room" not in st.session_state and st.query_params.get("room"):
-    st.session_state.room = st.query_params["room"].strip().upper()
-if not have_both and st.session_state.get("room"):
+# A shared link (?room=CODE) works once per page load, for pair codes and swipe codes alike
+qp = (st.query_params.get("room") or "").strip().upper()
+if qp and st.session_state.get("qp_handled") != qp:
+    st.session_state.qp_handled = qp
+    if not st.session_state.get("pair"):
+        st.session_state.join_error = route_code(qp)
+
+pair_code, me = st.session_state.get("pair"), st.session_state.get("me")
+pair = get_room(pair_code) if pair_code else None
+if pair_code and not pair:
+    unpair()
+    st.session_state.join_error = "Your pairing has expired (they last 12 hours). Start a new one below."
+paired = bool(pair and all(pair["slots"]) and me is not None)
+
+# 1. Started a pair, waiting for the other person to upload
+if pair and not paired:
+    with header:
+        marquee("Pairing up", f"{esc(pair['slots'][0]['name'])} <em>&amp;</em> …",
+                "Waiting for your plus-one")
+    code_card(pair_code, "Send this link, or have them enter the code in Double Feature. They upload their own "
+                         "export and both phones open up together.")
+    md('<div class="sw-status"><span class="live"></span>Waiting for the other person to upload</div>')
+    pair_pulse(pair_code, pair_state(pair))
+    st.button("Cancel", on_click=unpair)
+    st.stop()
+
+# 2. Joining someone else's pair code
+if not paired and st.session_state.get("pair_join"):
+    jc = st.session_state.pair_join
+    room = get_room(jc)
+    with header:
+        if room:
+            marquee("Pairing up", f"{esc(room['slots'][0]['name'])} <em>&amp;</em> you",
+                    f"Pair code <b>{jc}</b>")
+        else:
+            marquee("Pairing up", "Double <em>Feature</em>", "Two phones<i>✦</i>One movie night")
+    if not room:
+        note("<b>That code has expired.</b> Ask for a new one.")
+        st.button("Back", on_click=unpair)
+    elif room["slots"][1] is None:
+        note(f"<b>{esc(room['slots'][0]['name'])} wants to pair up.</b> Add your own Letterboxd export and "
+             "you'll both get the full app on your own phones.")
+        st.caption(UPLOAD_HELP)
+        st.text_input("Your name", key="pj_name", placeholder=NAME_HINT)
+        st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="pj_file")
+        st.button("Pair up", type="primary", width="stretch", on_click=finish_pair, args=(jc,),
+                  disabled=not st.session_state.get("pj_file"))
+        if st.session_state.get("pj_error"):
+            st.error(st.session_state.pj_error)
+        st.button("Cancel", on_click=unpair)
+    else:
+        section("Which one are you?", kicker=f"Pair {jc}", first=True,
+                note="This pair is already set up. Pick your name to open it on this phone.")
+        cols = st.columns(2)
+        for i, (col, slot) in enumerate(zip(cols, room["slots"])):
+            col.button(slot["name"], key=f"rejoin_{i}", width="stretch", on_click=rejoin_pair, args=(jc, i))
+    st.stop()
+
+# 3. Joining a swipe session on a phone with no exports
+if not paired and not have_both and st.session_state.get("room"):
     room = get_room(st.session_state.room)
     with header:
         if room:
@@ -881,38 +1070,52 @@ if not have_both and st.session_state.get("room"):
         st.button("Leave this session", on_click=leave_room)
     st.stop()
 
-with st.expander("Your Letterboxd exports", expanded=not have_both):
-    st.caption(
-        "On letterboxd.com (not the app) go to Settings → Data → Export your data, then upload "
-        "the .zip. If it got unzipped, pick watched.csv, ratings.csv and watchlist.csv instead. "
-        "Files stay in this session and aren't saved."
-    )
-    name_a = st.text_input("First person", placeholder="Name (optional, otherwise we use Letterboxd's)")
-    file_a = st.file_uploader("First person's export", type=["zip", "csv"],
-                              accept_multiple_files=True, key="file_a")
-    st.divider()
-    name_b = st.text_input("Second person", placeholder="Name (optional, otherwise we use Letterboxd's)")
-    file_b = st.file_uploader("Second person's export", type=["zip", "csv"],
-                              accept_multiple_files=True, key="file_b")
+if paired:
+    s0, s1 = pair["slots"]
+    raw_a, raw_b, name_a, name_b = s0["raw"], s1["raw"], s0["name"], s1["name"]
+    with st.expander(f"Paired on two phones · {pair_code}"):
+        st.caption(f"This phone is {[name_a, name_b][me]}'s. Both exports are held in the app's memory "
+                   "for up to 12 hours so each phone can load them, and never saved to disk.")
+        st.button("Unpair this phone", on_click=unpair)
+    pair_pulse(pair_code, pair_state(pair))
+else:
+    mode = "one" if have_both else st.segmented_control(
+        "How are you doing this?", ["own", "one"], default="own", key="mode", label_visibility="collapsed",
+        format_func={"own": "Each on our own phone", "one": "Both on this phone"}.get) or "own"
+    if not have_both:
+        with header:
+            marquee("Now showing", "Double <em>Feature</em>", "Two Letterboxd accounts<i>✦</i>One movie night")
+            note("<b>Here's the plan.</b> Add both of your Letterboxd exports and you'll get a film to watch "
+                 "tonight, a taste-match score, a swipe-to-match game and a list of what to show each other.")
 
-if not (file_a and file_b):
-    with header:
-        marquee("Now showing", "Double <em>Feature</em>",
-                "Two Letterboxd accounts<i>✦</i>One movie night")
-        note("<b>Here's the plan.</b> Each of you exports your Letterboxd data, drop both exports below, "
-             "and you'll get a film to watch tonight, a taste-match score, and a list of what to "
-             "show each other.")
-    section("Got a room code?", kicker="Swipe night",
-            note="If the other person already started a swipe session on their phone, join it here. "
-                 "You don't need to upload anything.")
-    c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
-    c1.text_input("Room code", key="join_code", max_chars=4, placeholder="ABCD")
-    c2.button("Join", type="primary", width="stretch", on_click=join_room)
-    if st.session_state.get("join_error"):
-        st.caption(st.session_state.join_error)
-    st.stop()
+    if mode == "own":
+        section("Start here", kicker="Each on your own phone", first=True,
+                note="Upload your own export and you'll get a code to send to the other person. "
+                     "Nobody needs to log in to anyone else's Letterboxd.")
+        st.caption(UPLOAD_HELP)
+        st.text_input("Your name", key="sp_name", placeholder=NAME_HINT)
+        st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="sp_file")
+        st.button("Get a pair code", type="primary", width="stretch", on_click=start_pair,
+                  disabled=not st.session_state.get("sp_file"))
+        if st.session_state.get("sp_error"):
+            st.error(st.session_state.sp_error)
+        join_box()
+        st.stop()
 
-raw_a, raw_b = bundle(file_a), bundle(file_b)
+    with st.expander("Your Letterboxd exports", expanded=not have_both):
+        st.caption(UPLOAD_HELP + " Files stay in this session and aren't saved.")
+        name_a = st.text_input("First person", placeholder=NAME_HINT)
+        file_a = st.file_uploader("First person's export", type=["zip", "csv"],
+                                  accept_multiple_files=True, key="file_a")
+        st.divider()
+        name_b = st.text_input("Second person", placeholder=NAME_HINT)
+        file_b = st.file_uploader("Second person's export", type=["zip", "csv"],
+                                  accept_multiple_files=True, key="file_b")
+    if not (file_a and file_b):
+        join_box()
+        st.stop()
+    raw_a, raw_b = bundle(file_a), bundle(file_b)
+
 try:
     da, db = load_export(raw_a), load_export(raw_b)
 except (zipfile.BadZipFile, TypeError, pd.errors.ParserError):
@@ -931,6 +1134,11 @@ B = name_b.strip() or db["name"] or "Person 2"
 if A.casefold() == B.casefold():
     B = f"{B} (2)"
 COLOURS.update({A: GOLD, B: SEA})
+
+# Paired: let this phone know when the other one starts a swipe session
+if paired and pair["swipe"] and pair["swipe"] != st.session_state.get("seen_swipe"):
+    st.session_state.seen_swipe = pair["swipe"]
+    st.toast(f"{[A, B][1 - me]} started a swipe session. Open the Swipe tab to join in.")
 
 pa, pb = summarise(da), summarise(db)
 cat = build_catalog(da, db)
@@ -1009,7 +1217,32 @@ def start_room(names, deck):
 
 with t_swipe:
     code = st.session_state.get("room")
-    if code and get_room(code):
+    sc = pair["swipe"] if paired else None
+    deck = [{"key": k, "name": str(cat.at[k, "Name"]), "year": year_str(cat.at[k, "Year"]),
+             "uri": str(cat.at[k, "Letterboxd URI"]) if pd.notna(cat.at[k, "Letterboxd URI"]) else "",
+             "why": reason_plain(why)} for k, why in pool.items()]
+    if paired and sc and get_room(sc):
+        seat = [A, B][me]
+        if st.session_state.get(f"seat_{sc}") != seat:
+            choose_seat(sc, seat)
+        swipe_view(sc)
+        st.button("End swipe session", on_click=end_pair_swipe, args=(pair_code,))
+    elif paired:
+        other = [A, B][1 - me]
+        section("Swipe to match", kicker="Swipe night", first=True,
+                note="Like a dating app, but for films. The first film you both swipe right on is the one.")
+        md(f'<div class="how"><div><b>1</b>Start a session. You\'re already paired, so there\'s no code: '
+           f'{esc(other)} gets the same deck on their phone.</div>'
+           '<div><b>2</b>You each swipe through the same films. Right to watch, left to pass.</div>'
+           '<div><b>3</b>The first film you both like pops up on both phones.</div></div>')
+        if not pool:
+            note("The deck uses the films in the Pick tab, and it's empty right now. "
+                 "Open Filters there to add more.")
+        else:
+            st.button(f"Start swiping · {min(len(deck), DECK_MAX)} films", type="primary", width="stretch",
+                      on_click=start_pair_swipe, args=(pair_code, [A, B], deck, [A, B][me]))
+            st.caption("The deck is the Pick tab's pool, including any filters you've set there.")
+    elif code and get_room(code):
         swipe_view(code, host=True)
         st.button("End swipe session", on_click=leave_room)
     else:
@@ -1023,9 +1256,6 @@ with t_swipe:
             note("The deck uses the films in the Pick tab, and it's empty right now. "
                  "Open Filters there to add more.")
         else:
-            deck = [{"key": k, "name": str(cat.at[k, "Name"]), "year": year_str(cat.at[k, "Year"]),
-                     "uri": str(cat.at[k, "Letterboxd URI"]) if pd.notna(cat.at[k, "Letterboxd URI"]) else "",
-                     "why": reason_plain(why)} for k, why in pool.items()]
             n = min(len(deck), DECK_MAX)
             st.button(f"Start a swipe session · {n} films", type="primary", width="stretch",
                       on_click=start_room, args=([A, B], deck))
