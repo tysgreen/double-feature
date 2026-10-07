@@ -3,6 +3,9 @@
 import html
 import io
 import random
+import string
+import threading
+import time
 import zipfile
 import zlib
 
@@ -46,12 +49,24 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_export(raw: bytes) -> dict:
     z = zipfile.ZipFile(io.BytesIO(raw))
-    out = {}
+    out = {"found": 0}
     for name in ("watched", "ratings", "watchlist"):
         path = _find(z, f"{name}.csv")
+        out["found"] += bool(path)
         out[name] = _clean(pd.read_csv(z.open(path)) if path else EMPTY)
     if "Rating" not in out["ratings"].columns:
         out["ratings"]["Rating"] = pd.Series(dtype=float)
+    # profile.csv gives a default display name: given name, else Letterboxd username
+    out["name"] = ""
+    path = _find(z, "profile.csv")
+    if path:
+        try:
+            prof = pd.read_csv(z.open(path), dtype=str).fillna("")
+            if len(prof):
+                row = prof.iloc[0]
+                out["name"] = (row.get("Given Name", "") or row.get("Username", "")).strip()
+        except (pd.errors.ParserError, UnicodeDecodeError):
+            pass
     return out
 
 
@@ -330,6 +345,7 @@ button[data-variant="pills"][aria-pressed="true"], button[data-variant="segmente
 .fly-a, .fly-b { display: flex; align-items: center; gap: .35rem; font-size: .72rem; color: var(--muted); }
 .fly-a { flex-direction: row-reverse; }
 .fly-a i, .fly-b i { display: block; height: .95rem; min-width: 2px; }
+.fly-a i[style^="width:0.0%"], .fly-b i[style^="width:0.0%"] { display: none; }
 .fly-a i { background: linear-gradient(270deg, var(--gold), #E6A936); border-radius: 4px 2px 2px 4px; }
 .fly-b i { background: linear-gradient(90deg, var(--sea), #6FAFAA); border-radius: 2px 4px 4px 2px; }
 
@@ -368,13 +384,17 @@ MOTIFS = [
     "radial-gradient(ellipse 46% 36% at 50% 100%, {c} 0 99%, #0000 100%)",
     "conic-gradient(from 155deg at 50% 0%, #0000 0deg, {c}66 22deg 50deg, #0000 50deg)",
     "radial-gradient(circle at 37% 64%, {c}D0 0 19%, #0000 19.6%), radial-gradient(circle at 63% 64%, {c}80 0 19%, #0000 19.6%)",
-    "linear-gradient(90deg, #0000 30%, {c} 30% 36%, #0000 36% 64%, {c} 64% 70%, #0000 70%)",
+    "linear-gradient(90deg, #0000 30%, {c} 30% 36%, #0000 36% 64%, {c} 64% 70%, #0000 70%) 0 72% / 100% 46% no-repeat",
 ]
 
 
 def poster(k, size="md", link=True) -> str:
-    """A tiny screen-printed 'poster' generated from the film's title, so every film has art."""
     r = cat.loc[k]
+    return poster_html(k, r["Name"], year_str(r["Year"]), r["Letterboxd URI"], size, link)
+
+
+def poster_html(k, name, year, uri, size="md", link=True) -> str:
+    """A tiny screen-printed 'poster' generated from the film's title, so every film has art."""
     h = zlib.crc32(str(k).encode())
     i = h % len(PALETTES)
     if size == "lg" and PALETTES[i][0] == GOLD:  # don't put a gold poster on the gold ticket
@@ -382,9 +402,8 @@ def poster(k, size="md", link=True) -> str:
     top, bottom, c, ink = PALETTES[i]
     motif = MOTIFS[(h // 13) % len(MOTIFS)].format(c=c)
     style = f"--pi:{ink};background:{motif},linear-gradient(170deg,{top},{bottom})"
-    inner = f'<span class="p-t">{esc(str(r["Name"]))}</span><span class="p-y">{year_str(r["Year"])}</span>'
-    uri = r["Letterboxd URI"]
-    if link and pd.notna(uri):
+    inner = f'<span class="p-t">{esc(str(name))}</span><span class="p-y">{esc(str(year or ""))}</span>'
+    if link and pd.notna(uri) and uri:
         return f'<a class="poster p-{size}" style="{style}" href="{esc(str(uri))}" target="_blank">{inner}</a>'
     return f'<div class="poster p-{size}" style="{style}">{inner}</div>'
 
@@ -472,42 +491,446 @@ def marquee(kicker: str, title: str, sub: str):
        f'<div class="mq-title">{title}</div><div class="mq-sub">{sub}</div></div></div>')
 
 
-# ---------- Uploads ----------
+# ---------- Tickets ----------
+
+def ticket(k, name, year, uri, why_html: str, kicker: str = "Tonight's feature", flip: str = "a") -> str:
+    link = (f'<a class="tk-link" href="{esc(str(uri))}" target="_blank">Open on Letterboxd →</a>'
+            if uri and pd.notna(uri) else "")
+    serial = f"No. {zlib.crc32(str(k).encode()) % 900000 + 100000}"
+    return (f'<div class="ticket {flip}"><div class="tk-stub"><span>Admit two</span><small>{serial}</small></div>'
+            f'<div class="tk-main"><div class="tk-kick">{kicker}</div>'
+            f'<div class="tk-body">{poster_html(k, name, year, uri, "lg", link=False)}<div style="min-width:0">'
+            f'<div class="tk-title">{esc(str(name))}</div><div class="tk-year">{esc(str(year or ""))}</div>'
+            f'<div class="tk-why">{why_html}</div></div></div>{link}</div></div>')
+
+
+# ---------- Swipe night: shared rooms so two phones can swipe on the same deck ----------
+# Rooms live in server memory (one dict shared by every session), keyed by a 4-letter code.
+# Nothing personal is stored: just the two display names, the film list and the yes/no votes.
+
+ROOM_TTL = 12 * 3600
+CODE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+DECK_MAX = 60
+
+
+@st.cache_resource
+def _room_store():
+    return {"lock": threading.Lock(), "rooms": {}}
+
+
+def get_room(code):
+    if not code:
+        return None
+    room = _room_store()["rooms"].get(str(code).strip().upper())
+    if room and time.time() - room["created"] > ROOM_TTL:
+        return None
+    return room
+
+
+def create_room(names, deck) -> str:
+    store = _room_store()
+    with store["lock"]:
+        now = time.time()
+        for c in [c for c, r in store["rooms"].items() if now - r["created"] > ROOM_TTL]:
+            del store["rooms"][c]
+        code = "".join(random.choices(CODE_LETTERS, k=4))
+        while code in store["rooms"]:
+            code = "".join(random.choices(CODE_LETTERS, k=4))
+        random.Random(code).shuffle(deck)  # same order on both phones
+        store["rooms"][code] = {
+            "code": code, "created": now, "names": list(names), "deck": deck[:DECK_MAX],
+            "full_deck": deck[:DECK_MAX], "votes": {n: {} for n in names}, "joined": set(),
+            "match": None, "passed": set(), "round": 1,
+        }
+    return code
+
+
+def cast_vote(code, seat, key, like):
+    store = _room_store()
+    with store["lock"]:
+        room = get_room(code)
+        if not room or seat not in room["votes"] or room["match"]:
+            return
+        if key not in {c["key"] for c in room["deck"]}:
+            return
+        room["votes"][seat][key] = like
+        if like and all(v.get(key) for v in room["votes"].values()):
+            room["match"] = key
+
+
+def new_round(code, keys=None):
+    """Start again, either with a subset of the deck (the 'maybe' pile) or the whole thing."""
+    store = _room_store()
+    with store["lock"]:
+        room = get_room(code)
+        if not room:
+            return
+        pool_ = room["full_deck"]
+        room["deck"] = [c for c in pool_ if c["key"] in keys] if keys else list(pool_)
+        room["votes"] = {n: {} for n in room["names"]}
+        room["match"], room["passed"] = None, set()
+        room["round"] += 1
+
+
+def keep_swiping(code):
+    store = _room_store()
+    with store["lock"]:
+        room = get_room(code)
+        if room and room["match"]:
+            room["passed"].add(room["match"])
+            room["match"] = None
+
+
+def room_state(room, seat):
+    """What both phones need to agree on. When this changes, the other phone reloads."""
+    other = next(n for n in room["names"] if n != seat)
+    n = len(room["deck"])
+    return (room["match"], room["round"], len(room["votes"][other]) >= n, other in room["joined"])
+
+
+SWIPE_JS = """
+export default function(component) {
+  const { data, setTriggerValue, parentElement } = component;
+  let root = parentElement.querySelector('.sw-root');
+  if (!root) {
+    root = document.createElement('div'); root.className = 'sw-root'; parentElement.appendChild(root);
+    // first time the deck appears, scroll so the card and buttons fill the screen
+    setTimeout(() => root.scrollIntoView({ behavior: 'smooth', block: 'end' }), 350);
+  }
+  root.innerHTML = data.html;
+  const card = root.querySelector('.sw-card.top');
+  if (!card) return;
+  const key = card.dataset.key;
+  const yes = card.querySelector('.stamp-yes'), no = card.querySelector('.stamp-no');
+  let sx = 0, sy = 0, dx = 0, dy = 0, dragging = false, done = false;
+  const send = (like) => {
+    if (done) return; done = true;
+    card.style.transition = 'transform .38s ease-in, opacity .38s ease-in';
+    card.style.transform = `translate(${like ? 560 : -560}px, ${dy * 1.5}px) rotate(${like ? 28 : -28}deg)`;
+    card.style.opacity = '0';
+    (like ? yes : no).style.opacity = 1;
+    setTimeout(() => setTriggerValue('swipe', { key, like, t: Date.now() }), 230);
+  };
+  card.addEventListener('pointerdown', (e) => {
+    if (done || e.target.closest('a')) return;
+    dragging = true; sx = e.clientX; sy = e.clientY; dx = dy = 0;
+    card.setPointerCapture(e.pointerId); card.style.transition = 'none';
+  });
+  card.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    dx = e.clientX - sx; dy = e.clientY - sy;
+    card.style.transform = `translate(${dx}px, ${dy * 0.3}px) rotate(${dx / 16}deg)`;
+    yes.style.opacity = Math.max(0, Math.min(1, dx / 90));
+    no.style.opacity = Math.max(0, Math.min(1, -dx / 90));
+  });
+  const end = () => {
+    if (!dragging) return; dragging = false;
+    if (Math.abs(dx) > 90) { send(dx > 0); return; }
+    card.style.transition = 'transform .35s cubic-bezier(.2,.9,.3,1.4)';
+    card.style.transform = ''; yes.style.opacity = 0; no.style.opacity = 0;
+  };
+  card.addEventListener('pointerup', end);
+  card.addEventListener('pointercancel', end);
+  root.querySelector('.sw-yes').onclick = () => send(true);
+  root.querySelector('.sw-no').onclick = () => send(false);
+}
+"""
+swiper = st.components.v2.component("swipe_deck", js=SWIPE_JS, isolate_styles=False)
+
+ICON_X = ('<svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2.6" '
+          'stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>')
+ICON_HEART = ('<svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor"><path d="M12 21s-7.5-4.6-9.6-9.2'
+              'C.9 8.1 3 4 6.9 4c2.1 0 3.6 1.1 5.1 3 1.5-1.9 3-3 5.1-3C21 4 23.1 8.1 21.6 11.8 19.5 16.4 12 21 12 21z"/>'
+              '</svg>')
+
+
+def swipe_card(c, cls: str) -> str:
+    art = poster_html(c["key"], c["name"], "", None, "xl", link=False)
+    uri = c.get("uri")
+    lb = (f'<a class="sw-lb" href="{esc(str(uri))}" target="_blank">Letterboxd ↗</a>' if uri else "")
+    return (f'<div class="sw-card {cls}" data-key="{esc(c["key"])}">{art}'
+            f'<div class="stamp stamp-yes">Watch</div><div class="stamp stamp-no">Pass</div>'
+            f'<div class="sw-info"><div><b>{esc(str(c["year"] or ""))}</b> · {esc(c["why"])}</div>{lb}</div></div>')
+
+
+def on_swipe(code, seat):
+    v = (st.session_state.get(f"deck_{code}") or {}).get("swipe")
+    if v and v.get("key"):
+        cast_vote(code, seat, v["key"], bool(v.get("like")))
+
+
+def choose_seat(code, name):
+    st.session_state[f"seat_{code}"] = name
+    with _room_store()["lock"]:
+        room = get_room(code)
+        if room:
+            room["joined"].add(name)
+
+
+def leave_room():
+    st.session_state.pop("room", None)
+    st.query_params.pop("room", None)
+
+
+@st.fragment(run_every=2)
+def room_pulse(code, seat, seen):
+    room = get_room(code)
+    if not room:
+        return
+    if room_state(room, seat) != seen:
+        st.rerun(scope="app")
+    other = next(n for n in room["names"] if n != seat)
+    n, total = len(room["votes"][other]), len(room["deck"])
+    if other not in room["joined"] and not n:
+        status = "hasn't joined yet"
+    elif n >= total:
+        status = "has finished swiping"
+    else:
+        status = f"is swiping · {n} of {total}"
+    md(f'<div class="sw-status"><span class="live"></span><b style="color:{COLOURS.get(other, SEA)}">'
+       f'{esc(other)}</b> {status}</div>')
+
+
+def swipe_view(code, host=False):
+    room = get_room(code)
+    if not room:
+        note("<b>That swipe session has ended.</b> Sessions last 12 hours, and restarting the app clears them. "
+             "Start a new one from the Swipe tab.")
+        st.button("OK", on_click=leave_room)
+        return
+    names = room["names"]
+    COLOURS.update({names[0]: GOLD, names[1]: SEA})
+    seat = st.session_state.get(f"seat_{code}")
+
+    if host and len(room["joined"]) < 2:
+        link = f"{st.context.url.split('?')[0]}?room={code}" if st.context.url else ""
+        md(f'<div class="room"><div class="room-k">Room code</div><div class="room-code">{code}</div>'
+           f'<div class="room-n">Open Double Feature on the other phone and enter this code, '
+           f'or send this link:</div></div>')
+        if link:
+            st.code(link, language=None)
+
+    if seat not in names:
+        section("Who's on this phone?", kicker=f"Room {code}", first=not host)
+        cols = st.columns(2)
+        for col, n in zip(cols, names):
+            taken = n in room["joined"]
+            col.button(f"I'm {n}" + (" (joined)" if taken else ""), key=f"seat_btn_{n}", width="stretch",
+                       on_click=choose_seat, args=(code, n))
+        return
+
+    other = next(n for n in names if n != seat)
+    mine = room["votes"][seat]
+    match = room["match"]
+    room_pulse(code, seat, room_state(room, seat))
+
+    if match:
+        c = next(c for c in room["deck"] if c["key"] == match)
+        md(f'<div class="its-match"><div class="im-k">✦ It\'s a match ✦</div>'
+           f'<div class="im-t">{esc(names[0])} <em>&amp;</em> {esc(names[1])}</div>'
+           f'<div class="im-n">You both swiped right. Tonight\'s film is…</div></div>')
+        md(ticket(c["key"], c["name"], c["year"], c["uri"], esc(c["why"]), kicker="Matched for tonight"))
+        st.button("Keep swiping for another", width="stretch", on_click=keep_swiping, args=(code,))
+        return
+
+    deck = [c for c in room["deck"] if c["key"] not in room["passed"]]
+    todo = [c for c in deck if c["key"] not in mine]
+    if todo:
+        done_n = len(deck) - len(todo)
+        md(f'<div class="sw-head"><span>{dot(seat)}Swiping as <b>{esc(seat)}</b></span>'
+           f'<span>{done_n + 1} / {len(deck)}</span></div>'
+           f'<div class="sw-prog"><i style="width:{100 * done_n / max(len(deck), 1):.1f}%"></i></div>')
+        cards = swipe_card(todo[0], "top") + (swipe_card(todo[1], "next") if len(todo) > 1 else "")
+        html_ = (f'<div class="sw-stack">{cards}</div><div class="sw-btns">'
+                 f'<button class="sw-btn sw-no" aria-label="Pass">{ICON_X}</button>'
+                 f'<button class="sw-btn sw-yes" aria-label="Watch">{ICON_HEART}</button></div>'
+                 f'<div class="sw-hint">Swipe right to watch, left to pass</div>')
+        swiper(key=f"deck_{code}", data={"html": html_}, on_swipe_change=lambda: on_swipe(code, seat))
+        return
+
+    theirs = room["votes"][other]
+    if len(theirs) < len(room["deck"]):
+        note(f"<b>You're done.</b> Waiting for {esc(other)} to finish. "
+             f"If you both like the same film, it'll pop up here.")
+        return
+    maybes = [c["key"] for c in deck if mine.get(c["key"]) or theirs.get(c["key"])]
+    if not maybes:
+        msg = "You passed on everything. Tough crowd."
+    elif len(maybes) < len(deck):
+        msg = f"{len(maybes)} films got a yes from one of you. Swipe on just those to settle it?"
+    else:
+        msg = "Every film got a yes from one of you, just never both at once. Go again?"
+    note(f"<b>No match this round.</b> {msg}")
+    if maybes and len(maybes) < len(deck):
+        st.button("Swipe the maybes", type="primary", width="stretch", on_click=new_round, args=(code, maybes))
+    st.button("Start over with the whole deck", width="stretch", on_click=new_round, args=(code,))
+
+
+SWIPE_CSS = """
+<style>
+.room { text-align: center; border-radius: 18px; padding: 1rem 1rem .9rem; margin: .4rem 0 .5rem;
+  background: linear-gradient(160deg, rgba(242,193,78,.14), rgba(142,197,192,.08));
+  box-shadow: inset 0 0 0 1px rgba(242,193,78,.3); }
+.room-k { font-family: var(--label); letter-spacing: .26em; font-size: .85rem; color: var(--gold); }
+.room-code { font-family: var(--label); font-size: 3.6rem; letter-spacing: .3em; line-height: 1; padding: .3rem 0 .2rem .3em;
+  color: var(--cream); text-shadow: 0 0 24px rgba(242,193,78,.35); }
+.room-n { color: var(--muted); font-size: .88rem; line-height: 1.45; }
+.sw-head { display: flex; justify-content: space-between; align-items: center; font-size: .88rem; color: var(--muted);
+  margin: .5rem 0 .45rem; }
+.sw-head b { color: var(--cream); font-weight: 600; }
+.sw-head span:last-child { font-family: var(--label); letter-spacing: .14em; font-size: .95rem; }
+.sw-prog { height: 3px; border-radius: 3px; background: rgba(243,236,221,.08); overflow: hidden; margin-bottom: .9rem; }
+.sw-prog i { display: block; height: 100%; background: linear-gradient(90deg, var(--gold), var(--sea)); }
+.sw-stack { position: relative; height: min(450px, calc(100svh - 250px), 120vw); aspect-ratio: 2 / 3; margin: 0 auto; }
+.sw-card { position: absolute; inset: 0; border-radius: 18px; overflow: hidden; touch-action: pan-y; user-select: none;
+  -webkit-user-select: none; cursor: grab; will-change: transform;
+  box-shadow: 0 24px 50px -20px rgba(0,0,0,.9), 0 0 0 1px rgba(255,255,255,.06); }
+.sw-card.top { z-index: 2; animation: sw-in .3s ease-out both; }
+.sw-card.next { z-index: 1; transform: translateY(12px) scale(.94); filter: brightness(.55); pointer-events: none; }
+@keyframes sw-in { from { transform: scale(.96); } }
+.sw-card .poster { position: absolute; inset: 0; width: 100%; height: 100%; aspect-ratio: auto; border-radius: 0; }
+.p-xl .p-t { font-size: 2.05rem; -webkit-line-clamp: 5; padding: 11% 10% 0; line-height: 1.02; }
+.p-xl .p-y { display: none; }
+.sw-info { position: absolute; left: 0; right: 0; bottom: 0; padding: 3.2rem 1.1rem 1rem; z-index: 3;
+  display: flex; justify-content: space-between; align-items: flex-end; gap: .6rem;
+  background: linear-gradient(180deg, rgba(10,14,22,0), rgba(10,14,22,.88)); font-size: .86rem; color: var(--cream); }
+.sw-info b { font-family: var(--label); letter-spacing: .12em; font-weight: 400; font-size: 1rem; }
+.sw-lb { flex: 0 0 auto; font-family: var(--label); letter-spacing: .12em; font-size: .85rem; color: var(--gold) !important;
+  text-decoration: none !important; padding: .3rem .6rem .15rem; border-radius: 999px; background: rgba(17,25,38,.7); }
+.stamp { position: absolute; top: 42%; z-index: 4; font-family: var(--label); font-size: 2.3rem; letter-spacing: .14em;
+  padding: .25rem .7rem 0; border: 4px solid; border-radius: 10px; opacity: 0; pointer-events: none;
+  background: rgba(17,25,38,.35); }
+.stamp-yes { left: 1rem; color: var(--sea); border-color: var(--sea); transform: rotate(-14deg); }
+.stamp-no { right: 1rem; color: var(--coral); border-color: var(--coral); transform: rotate(14deg); }
+.sw-btns { display: flex; justify-content: center; gap: 2rem; margin: 1.3rem 0 .4rem; }
+.sw-btn { width: 66px; height: 66px; border-radius: 50%; border: 0; display: grid; place-items: center; cursor: pointer;
+  transition: transform .15s; -webkit-tap-highlight-color: transparent; }
+.sw-btn:active { transform: scale(.9); }
+.sw-no { background: rgba(238,138,109,.1); color: var(--coral); box-shadow: inset 0 0 0 2px rgba(238,138,109,.55); }
+.sw-yes { background: linear-gradient(180deg, #F7D06E, var(--gold) 55%, var(--gold-deep)); color: var(--ink);
+  box-shadow: 0 10px 26px -8px rgba(242,193,78,.7); }
+.sw-hint { text-align: center; color: var(--muted); font-size: .8rem; margin-bottom: .6rem; }
+.sw-status { display: flex; align-items: center; justify-content: center; gap: .1rem; font-size: .85rem;
+  color: var(--muted); padding: .45rem .8rem; border-radius: 999px; background: rgba(27,37,54,.75);
+  box-shadow: inset 0 0 0 1px var(--line); width: fit-content; margin: .3rem auto .6rem; }
+.sw-status b { color: var(--cream); font-weight: 600; margin-right: .3rem; }
+.live { width: .45rem; height: .45rem; border-radius: 50%; background: #6FD08C; margin-right: .5rem;
+  box-shadow: 0 0 0 0 rgba(111,208,140,.6); animation: live 1.8s infinite; }
+@keyframes live { 70% { box-shadow: 0 0 0 7px rgba(111,208,140,0); } 100% { box-shadow: 0 0 0 0 rgba(111,208,140,0); } }
+.its-match { text-align: center; margin: .6rem 0 1rem; animation: pop .6s cubic-bezier(.2,.9,.25,1.3) both; }
+@keyframes pop { from { opacity: 0; transform: scale(.85); } }
+.im-k { font-family: var(--label); letter-spacing: .3em; color: var(--gold); font-size: 1rem; }
+.im-t { font-family: var(--display); font-size: 2.3rem; font-weight: 600; line-height: 1.05; margin: .25rem 0 .3rem;
+  text-shadow: 0 0 30px rgba(242,193,78,.35); }
+.im-t em { color: var(--gold); font-weight: 400; }
+.im-n { color: var(--muted); font-size: .92rem; }
+.how { display: grid; gap: 8px; margin: .8rem 0 1.1rem; }
+.how div { display: flex; gap: .8rem; align-items: center; border-radius: 14px; padding: .75rem .9rem;
+  background: rgba(27,37,54,.75); box-shadow: inset 0 0 0 1px var(--line); font-size: .9rem; line-height: 1.4; }
+.how b { flex: 0 0 1.9rem; height: 1.9rem; border-radius: 50%; display: grid; place-items: center; font-family: var(--label);
+  font-size: 1.05rem; font-weight: 400; background: rgba(242,193,78,.15); color: var(--gold); padding-top: .1rem; }
+@media (prefers-reduced-motion: reduce) { .sw-card.top, .its-match, .live { animation: none !important; } }
+</style>
+"""
+md(SWIPE_CSS)
+
+
+# ---------- Uploads (or joining someone else's swipe session) ----------
+
+def bundle(files):
+    """Turn an upload into zip bytes: the export zip itself, or loose CSVs from an unzipped export."""
+    files = files or []
+    for f in files:
+        if f.name.lower().endswith(".zip"):
+            return f.getvalue()
+    csvs = [f for f in files if f.name.lower().endswith(".csv")]
+    if not csvs:
+        return None
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for f in csvs:
+            z.writestr(f.name.rsplit("/", 1)[-1].lower(), f.getvalue())
+    return buf.getvalue()
+
+
+def join_room():
+    code = st.session_state.get("join_code", "").strip().upper()
+    if get_room(code):
+        st.session_state.room = code
+        st.session_state.join_error = ""
+    else:
+        st.session_state.join_error = f"No swipe session called {code or '…'}. Check the code on the other phone."
+
 
 header = st.container()
-have_both = all(st.session_state.get(k) is not None for k in ("file_a", "file_b"))
+have_both = all(st.session_state.get(k) for k in ("file_a", "file_b"))
+
+# Arriving with a room link, or after entering a code, on a phone with no exports loaded
+if "room" not in st.session_state and st.query_params.get("room"):
+    st.session_state.room = st.query_params["room"].strip().upper()
+if not have_both and st.session_state.get("room"):
+    room = get_room(st.session_state.room)
+    with header:
+        if room:
+            marquee("Swipe night", f"{esc(room['names'][0])} <em>&amp;</em> {esc(room['names'][1])}",
+                    f"Room <b>{room['code']}</b><i>✦</i><b>{len(room['deck'])}</b> films in the deck")
+        else:
+            marquee("Swipe night", "Double <em>Feature</em>", "Two phones<i>✦</i>One film")
+    swipe_view(st.session_state.room)
+    if room:
+        st.button("Leave this session", on_click=leave_room)
+    st.stop()
+
 with st.expander("Your Letterboxd exports", expanded=not have_both):
     st.caption(
         "On letterboxd.com (not the app) go to Settings → Data → Export your data, then upload "
-        "the .zip as it downloads. Files stay in this session and aren't saved."
+        "the .zip. If it got unzipped, pick watched.csv, ratings.csv and watchlist.csv instead. "
+        "Files stay in this session and aren't saved."
     )
-    name_a = st.text_input("First person", value="Tyler")
-    file_a = st.file_uploader(f"{name_a.strip() or 'First person'}'s export", type="zip", key="file_a")
+    name_a = st.text_input("First person", placeholder="Name (optional, otherwise we use Letterboxd's)")
+    file_a = st.file_uploader("First person's export", type=["zip", "csv"],
+                              accept_multiple_files=True, key="file_a")
     st.divider()
-    name_b = st.text_input("Second person", value="", placeholder="Her name")
-    file_b = st.file_uploader(f"{name_b.strip() or 'Second person'}'s export", type="zip", key="file_b")
-
-A = name_a.strip() or "Me"
-B = name_b.strip() or "Her"
-COLOURS.update({A: GOLD, B: SEA})
+    name_b = st.text_input("Second person", placeholder="Name (optional, otherwise we use Letterboxd's)")
+    file_b = st.file_uploader("Second person's export", type=["zip", "csv"],
+                              accept_multiple_files=True, key="file_b")
 
 if not (file_a and file_b):
     with header:
         marquee("Now showing", "Double <em>Feature</em>",
                 "Two Letterboxd accounts<i>✦</i>One movie night")
-        note("<b>Here's the plan.</b> Each of you exports your Letterboxd data, drop both zips below, "
+        note("<b>Here's the plan.</b> Each of you exports your Letterboxd data, drop both exports below, "
              "and you'll get a film to watch tonight, a taste-match score, and a list of what to "
              "show each other.")
+    section("Got a room code?", kicker="Swipe night",
+            note="If the other person already started a swipe session on their phone, join it here. "
+                 "You don't need to upload anything.")
+    c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
+    c1.text_input("Room code", key="join_code", max_chars=4, placeholder="ABCD")
+    c2.button("Join", type="primary", width="stretch", on_click=join_room)
+    if st.session_state.get("join_error"):
+        st.caption(st.session_state.join_error)
     st.stop()
 
+raw_a, raw_b = bundle(file_a), bundle(file_b)
 try:
-    da, db = load_export(file_a.getvalue()), load_export(file_b.getvalue())
-except zipfile.BadZipFile:
+    da, db = load_export(raw_a), load_export(raw_b)
+except (zipfile.BadZipFile, TypeError, pd.errors.ParserError):
+    da = db = None
+bad = [label for label, d in (("the first person", da), ("the second person", db)) if not d or not d["found"]]
+if bad:
     st.error(
-        "One of the uploads isn't a zip file. Upload the file Letterboxd gives you "
-        "from Settings → Data → Export your data, without unzipping it."
+        f"Couldn't read {' or '.join(bad)}'s export. Upload the .zip from letterboxd.com → Settings → Data "
+        "→ Export your data, or the watched.csv, ratings.csv and watchlist.csv files inside it."
     )
     st.stop()
+
+# Names: whatever was typed, else the name on the Letterboxd profile, else a placeholder
+A = name_a.strip() or da["name"] or "Person 1"
+B = name_b.strip() or db["name"] or "Person 2"
+if A.casefold() == B.casefold():
+    B = f"{B} (2)"
+COLOURS.update({A: GOLD, B: SEA})
 
 pa, pb = summarise(da), summarise(db)
 cat = build_catalog(da, db)
@@ -518,10 +941,10 @@ with header:
     marquee("Now showing", f"{esc(A)} <em>&amp;</em> {esc(B)}",
             f"<b>{len(both_seen)}</b> seen together<i>✦</i><b>{len(shared_wl)}</b> on both watchlists")
 
-t_pick, t_taste, t_swap, t_stats = st.tabs(["Tonight", "Taste", "Swaps", "Stats"])
+t_pick, t_swipe, t_taste, t_swap, t_stats = st.tabs(["Pick", "Swipe", "Taste", "Swaps", "Stats"])
 
 
-# ---------- Tonight ----------
+# ---------- Pick ----------
 
 def pick_film(options):
     st.session_state.pick = random.choice(options)
@@ -533,6 +956,10 @@ def reason_text(why, on_ticket=False) -> str:
         return "On both watchlists"
     name, r = why
     return f"{esc(name)} gave it {star_bar(r, None if on_ticket else COLOURS.get(name))}"
+
+
+def reason_plain(why) -> str:
+    return "On both watchlists" if why is None else f"{why[0]} gave it {stars(why[1])}"
 
 
 with t_pick:
@@ -560,16 +987,9 @@ with t_pick:
         pick = st.session_state.get("pick")
         if pick in pool:
             r = cat.loc[pick]
-            link = (f'<a class="tk-link" href="{esc(str(r["Letterboxd URI"]))}" target="_blank">'
-                    f'Open on Letterboxd →</a>' if pd.notna(r["Letterboxd URI"]) else "")
-            serial = f"No. {zlib.crc32(str(pick).encode()) % 900000 + 100000}"
             flip = "a" if st.session_state.get("picks", 0) % 2 else "b"
-            md(f'<div class="ticket {flip}"><div class="tk-stub"><span>Admit two</span><small>{serial}</small></div>'
-               f'<div class="tk-main"><div class="tk-kick">Tonight\'s feature</div>'
-               f'<div class="tk-body">{poster(pick, "lg", link=False)}<div style="min-width:0">'
-               f'<div class="tk-title">{esc(str(r["Name"]))}</div><div class="tk-year">{year_str(r["Year"])}</div>'
-               f'<div class="tk-why">{reason_text(pool[pick], on_ticket=True)}</div></div></div>'
-               f'{link}</div></div>')
+            md(ticket(pick, r["Name"], year_str(r["Year"]), r["Letterboxd URI"],
+                      reason_text(pool[pick], on_ticket=True), flip=flip))
         else:
             md(f'<div class="tk-ghost"><b>What are we watching?</b>{len(pool)} films in the hat. '
                f'Let fate decide.</div>')
@@ -579,6 +999,37 @@ with t_pick:
         section("The pool", kicker=f"{len(pool)} films in the hat")
         poster_wall(sorted(pool, key=lambda k: str(cat.at[k, "Name"]).casefold()), key="all_pool",
                     cap=lambda k: reason_text(pool[k]) if pool[k] else "")
+
+
+# ---------- Swipe ----------
+
+def start_room(names, deck):
+    st.session_state.room = create_room(names, deck)
+
+
+with t_swipe:
+    code = st.session_state.get("room")
+    if code and get_room(code):
+        swipe_view(code, host=True)
+        st.button("End swipe session", on_click=leave_room)
+    else:
+        section("Swipe to match", kicker="Swipe night", first=True,
+                note="Like a dating app, but for films. The first film you both swipe right on is the one.")
+        md('<div class="how"><div><b>1</b>Start a session here and you get a four-letter room code.</div>'
+           '<div><b>2</b>The other person opens Double Feature on their phone and enters it. '
+           'They don\'t need to upload anything.</div>'
+           '<div><b>3</b>You each swipe through the same films. Right to watch, left to pass.</div></div>')
+        if not pool:
+            note("The deck uses the films in the Pick tab, and it's empty right now. "
+                 "Open Filters there to add more.")
+        else:
+            deck = [{"key": k, "name": str(cat.at[k, "Name"]), "year": year_str(cat.at[k, "Year"]),
+                     "uri": str(cat.at[k, "Letterboxd URI"]) if pd.notna(cat.at[k, "Letterboxd URI"]) else "",
+                     "why": reason_plain(why)} for k, why in pool.items()]
+            n = min(len(deck), DECK_MAX)
+            st.button(f"Start a swipe session · {n} films", type="primary", width="stretch",
+                      on_click=start_room, args=([A, B], deck))
+            st.caption("The deck is the Pick tab's pool, including any filters you've set there.")
 
 
 # ---------- Taste ----------
