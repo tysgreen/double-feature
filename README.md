@@ -4,7 +4,7 @@
 
 Double Feature compares two people's Letterboxd data and helps them pick something to watch together. It's built for phones and styled like an old movie palace.
 
-👉 **[Open the app](https://YOUR-APP-NAME.streamlit.app)**
+👉 **[Open the app](https://double-feature.streamlit.app/)**
 
 ![Double Feature on a phone: the Pick, Swipe, Taste and Stats tabs](preview.png)
 
