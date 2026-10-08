@@ -228,7 +228,7 @@ button[data-variant="pills"][aria-pressed="true"], button[data-variant="segmente
   font-variation-settings: "SOFT" 100, "WONK" 1; letter-spacing: -.005em; }
 .p-y { font-family: var(--label); letter-spacing: .14em; margin-top: auto; padding: 0 9% 7%; opacity: .85; }
 .p-sm { width: 44px; flex: 0 0 44px; border-radius: 4px; }
-.poster.real img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; }
+.poster.real .p-img { position: absolute; inset: 0; z-index: 1; background: center / cover no-repeat; }
 .poster.real:before { z-index: 2; }
 .sw-title { font-family: var(--display); font-size: 1.15rem; font-weight: 600; line-height: 1.15; margin-top: .1rem; }
 .p-sm .p-t, .p-sm .p-y { display: none; }
@@ -1023,7 +1023,7 @@ def _known_genres(name, year, k=None) -> tuple:
     if not year and k and "|" in str(k):  # swipe cards hide the year, but the key still has it
         year = str(k).rsplit("|", 1)[1]
     try:
-        hit = _film_store()["films"].get(f"{title_key(name)}|{_norm_year(year)}")
+        hit = _film_store()["films"].get(_detail_key(name, _norm_year(year)))
     except Exception:
         return ()
     return tuple((hit[1] or {}).get("genres") or ()) if hit else ()
@@ -1035,9 +1035,10 @@ def poster_html(k, name, year, uri, size="md", link=True) -> str:
     style = f"--pi:{ink};background:{bg}"
     inner = f'<span class="p-t">{esc(str(name))}</span><span class="p-y">{esc(str(year or ""))}</span>'
     real = real_poster_url(k, size)
-    if real:  # the film's actual poster, over the generated art in case the image is slow
+    if real:  # the film's actual poster on top; the titled art stays underneath if it's slow or fails
         size += " real"
-        inner = f'<img src="{esc(real)}" alt="{esc(str(name))}" loading="lazy">'
+        # a background image, so a poster that fails to load just leaves the art showing (no broken-image icon)
+        inner += f'<span class="p-img" style="background-image:url(&quot;{esc(real)}&quot;)"></span>'
     if link and pd.notna(uri) and uri:
         return f'<a class="poster p-{size}" style="{style}" href="{esc(str(uri))}" target="_blank">{inner}</a>'
     return f'<div class="poster p-{size}" style="{style}">{inner}</div>'
@@ -1291,6 +1292,13 @@ def _fetch_info(name, year):
             "genres": [g["name"] for g in det.get("genres", [])][:3], "providers": providers}
 
 
+DETAIL_VERSION = 2  # bump when the lookup changes, so details cached by older code are fetched again
+
+
+def _detail_key(name, year):
+    return f"v{DETAIL_VERSION}|{title_key(name)}|{year}"
+
+
 def film_infos(items, limit=150):
     """items: [(key, name, year)]. Returns {key: info}, fetching anything new in parallel."""
     if not tmdb_on() or not items:
@@ -1299,7 +1307,7 @@ def film_infos(items, limit=150):
     offline = store.get("down_until", 0) > now  # TMDB failing (bad key or outage): don't keep retrying
     for k, name, year in items:
         y = _norm_year(year)
-        ck = f"{title_key(name)}|{y}"
+        ck = _detail_key(name, y)
         hit = store["films"].get(ck)
         if hit and now - hit[0] < DETAIL_TTL:
             out[k] = hit[1]
