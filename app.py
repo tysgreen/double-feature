@@ -590,17 +590,15 @@ def prefetch_posters(items):
 
 
 def settings_menu():
-    """Per-person settings: poster style and streaming country."""
+    """Per-person settings: poster style and streaming country. Hidden entirely when there's nothing to set."""
+    if not tmdb_on():
+        return
     with st.popover("Settings", icon=":material/tune:"):
-        if tmdb_on():
-            st.segmented_control("Posters", ["art", "real"], default="art",
-                                 key="poster_style", format_func={"art": "Minimal art", "real": "Real posters"}.get)
-            region = current_region()
-            st.selectbox("Streaming in", list(REGIONS), index=list(REGIONS).index(region),
-                          format_func=REGIONS.get, key="region")
-        else:
-            st.caption("Real posters and streaming info appear here once film details are switched on "
-                       "(see the README).")
+        st.segmented_control("Posters", ["art", "real"], default="art",
+                             key="poster_style", format_func={"art": "Minimal art", "real": "Real posters"}.get)
+        region = current_region()
+        st.selectbox("Streaming in", list(REGIONS), index=list(REGIONS).index(region),
+                      format_func=REGIONS.get, key="region")
 
 
 @st.cache_resource
@@ -747,7 +745,15 @@ SHARE_FONTS = Path(__file__).parent / "static" / "share"
 
 @functools.lru_cache(maxsize=64)
 def _font(name, size):
-    return ImageFont.truetype(str(SHARE_FONTS / f"{name}.ttf"), size)
+    """Share-image font. If the font file is missing (e.g. static/share wasn't deployed), fall back to
+    Pillow's built-in font rather than crashing the page."""
+    try:
+        return ImageFont.truetype(str(SHARE_FONTS / f"{name}.ttf"), size)
+    except OSError:
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:  # very old Pillow
+            return ImageFont.load_default()
 
 
 def _hex(c):
@@ -975,7 +981,13 @@ ICON_SHARE = ('<svg viewBox="0 0 24 24" width="18" height="18" fill="none" strok
               '0 0 0 2-2v-6"/></svg>')
 
 
-def share_button(img_bytes, filename, text, key, label="Share"):
+def share_button(make_image, filename, text, key, label="Share"):
+    """make_image is called here so that if drawing the image ever fails, the button is skipped
+    instead of the whole page showing an error."""
+    try:
+        img_bytes = make_image() if callable(make_image) else make_image
+    except Exception:
+        return
     sharer(key=key, data={"img": base64.b64encode(img_bytes).decode(), "filename": filename, "text": text,
                           "label": f"{ICON_SHARE}<span>{esc(label)}</span>"})
 
@@ -1214,7 +1226,7 @@ def room_pulse(code, seat, seen):
 def swipe_view(code, host=False):
     room = get_room(code)
     if not room:
-        note("<b>That swipe session has ended.</b> Sessions last 12 hours, and restarting the app clears them. "
+        note("<b>That swipe session has ended.</b> Sessions last up to 12 hours. "
              "Start a new one from the Swipe tab.")
         st.button("OK", on_click=leave_room)
         return
@@ -1253,7 +1265,7 @@ def swipe_view(code, host=False):
         why = esc(c["why"]) + "".join(f'<div class="{cls}">{esc(c[f])}</div>'
                                       for f, cls in (("meta", "tk-meta"), ("stream", "tk-stream")) if c.get(f))
         md(ticket(c["key"], c["name"], c["year"], c["uri"], why, kicker="Matched for tonight"))
-        share_button(share_film_png("It's a match", f"{names[0]} & {names[1]}", c["key"], c["name"], c["year"],
+        share_button(lambda: share_film_png("It's a match", f"{names[0]} & {names[1]}", c["key"], c["name"], c["year"],
                                     c.get("meta", ""), c.get("stream", ""), real_poster_url(c["key"], "xl")),
                      "double-feature-match.jpg", f"It's a match: {c['name']} 🎬", key=f"share_match_{code}",
                      label="Share the match")
@@ -2039,7 +2051,7 @@ def group_view(code, mid):
             wi = film_infos([(win["key"], win["name"], win["year"])]).get(win["key"])
             md(ticket(win["key"], win["name"], win["year"], win["uri"],
                       esc(by_names(room, win)) + info_lines_html(wi, region), kicker="Group favourite"))
-            share_button(share_film_png("Group favourite", f"{host}'s movie night", win["key"], win["name"],
+            share_button(lambda: share_film_png("Group favourite", f"{host}'s movie night", win["key"], win["name"],
                                         win["year"], details_text(wi), stream_text(wi, region),
                                         real_poster_url(win["key"], "xl")),
                          "double-feature-movie-night.jpg", f"Tonight's movie night pick: {win['name']} 🍿",
@@ -2389,7 +2401,7 @@ with t_pick:
             flip = "a" if st.session_state.get("picks", 0) % 2 else "b"
             md(ticket(pick, r["Name"], year_str(r["Year"]), r["Letterboxd URI"],
                       reason_text(pool[pick], on_ticket=True) + info_lines_html(infos.get(pick), region), flip=flip))
-            share_button(share_film_png("Tonight's pick", f"{A} & {B}", pick, str(r["Name"]), year_str(r["Year"]),
+            share_button(lambda: share_film_png("Tonight's pick", f"{A} & {B}", pick, str(r["Name"]), year_str(r["Year"]),
                                         details_text(infos.get(pick)), stream_text(infos.get(pick), region),
                                         real_poster_url(pick, "xl")),
                          "double-feature-pick.jpg", f"Tonight's pick: {r['Name']} 🎬", key="share_pick",
@@ -2486,7 +2498,7 @@ with t_taste:
            f'<div class="trio"><div><b>{len(common)}</b><span>Both rated</span></div>'
            f'<div><b>{gap.mean():.1f}★</b><span>Average gap</span></div>'
            f'<div><b>{esc(tougher)}</b><span>Tougher critic</span></div></div>')
-        share_button(share_taste_png(score, verdict, A, B, len(common), round(float(gap.mean()), 1), tougher),
+        share_button(lambda: share_taste_png(score, verdict, A, B, len(common), round(float(gap.mean()), 1), tougher),
                      "double-feature-taste.jpg", f"Our taste match: {score}% 🎬", key="share_taste",
                      label="Share our taste match")
 
