@@ -25,7 +25,7 @@ There's also a **Group night** mode for more than two people. Everyone brings a 
 On top of that:
 
 - **Film details:** each film shows its length and genre, and **where it's streaming** in your country.
-- **Poster style:** under **Settings**, each person can choose a minimal art style or the films' real posters.
+- **Poster style:** under **Settings**, each person can choose the minimal generated art or the films' real posters.
 - **Share:** a **Share** button turns tonight's pick, your match, your taste-match score or the group winner into an image for WhatsApp or Instagram.
 
 ## How to use it
