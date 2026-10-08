@@ -5,6 +5,7 @@ import concurrent.futures
 import functools
 import html
 import io
+import math
 import os
 import random
 import re
@@ -376,32 +377,640 @@ st.markdown(CSS, unsafe_allow_html=True)
 COLOURS = {}
 esc = html.escape
 
-# Poster palettes: (top, bottom, motif, ink)
-PALETTES = [
-    ("#2B1B3D", "#4A2A5E", "#F2C14E", "#F3ECDD"),
-    ("#0F3B3A", "#1C5A57", "#9ED3CD", "#F3ECDD"),
-    ("#7A2E25", "#B5452F", "#F4D6A0", "#FFF4E0"),
-    ("#1E2F4F", "#2F4A7A", "#F28C6B", "#F3ECDD"),
-    ("#EADBB8", "#D9C394", "#B5452F", "#2A1E18"),
-    ("#141414", "#2A2525", "#E8463A", "#F3ECDD"),
-    ("#3B5D3A", "#557A4E", "#F2E3B3", "#F8F1DC"),
-    ("#F2C14E", "#E3A23A", "#1E2F4F", "#172131"),
-    ("#5B2A44", "#8C3B5E", "#F7B2A8", "#FFEDE8"),
-    ("#20384A", "#2E5470", "#F2E8CF", "#F2E8CF"),
-    ("#C9D9D3", "#A8C3BA", "#1F4D4A", "#14302E"),
-    ("#3A1F14", "#6B3A22", "#F2A65A", "#FBE7CF"),
+# ---------- Generated poster art ----------
+# Every film gets a screen-print style poster. The picture comes from the title first ("Before Sunrise"
+# gets a sunrise, "Jaws" a fin in the water), then the film's genre if details are loaded, and otherwise
+# one of the abstract designs picked from a hash of the title. Shapes are described once, on a
+# 100 x 150 canvas, and drawn both as SVG (in the app) and with Pillow (in share images).
+
+# (top, bottom, motif colour, text colour)
+PALETTES = {
+    "plum": ("#2B1B3D", "#4A2A5E", "#F2C14E", "#F3ECDD"),
+    "teal": ("#0F3B3A", "#1C5A57", "#9ED3CD", "#F3ECDD"),
+    "brick": ("#7A2E25", "#B5452F", "#F4D6A0", "#FFF4E0"),
+    "navy": ("#1E2F4F", "#2F4A7A", "#F28C6B", "#F3ECDD"),
+    "paper": ("#EADBB8", "#D9C394", "#B5452F", "#2A1E18"),
+    "noir": ("#141414", "#2A2525", "#E8463A", "#F3ECDD"),
+    "moss": ("#3B5D3A", "#557A4E", "#F2E3B3", "#F8F1DC"),
+    "gold": ("#F2C14E", "#E3A23A", "#1E2F4F", "#172131"),
+    "rose": ("#5B2A44", "#8C3B5E", "#F7B2A8", "#FFEDE8"),
+    "slate": ("#20384A", "#2E5470", "#F2E8CF", "#F2E8CF"),
+    "mint": ("#C9D9D3", "#A8C3BA", "#1F4D4A", "#14302E"),
+    "rust": ("#3A1F14", "#6B3A22", "#F2A65A", "#FBE7CF"),
+    "dusk": ("#3D2352", "#B8494A", "#F6B352", "#FFF1DE"),
+    "blood": ("#160C0E", "#33141A", "#D7263D", "#F3ECDD"),
+    "frost": ("#DCE6EE", "#B6CADA", "#FFFFFF", "#1E2F4F"),
+    "sand": ("#EBCB91", "#D9A55B", "#8A3B12", "#2A1E18"),
+    "ocean": ("#0B2E4F", "#145A80", "#7FD1C7", "#EAF6F3"),
+    "pine": ("#16302A", "#24493D", "#C7D9A8", "#F0F4E6"),
+    "blush": ("#F4C7C3", "#E8A3A0", "#5B2A44", "#3A1A2A"),
+    "ink": ("#0E1726", "#1B2A44", "#F3ECDD", "#F3ECDD"),
+}
+ALL_PALETTES = list(PALETTES)
+
+
+# --- shape helpers. A shape is (kind, data, colour, alpha); colour is "c" (motif), "i" (text colour),
+# "k" (black), "t" (the poster's top colour) or a hex string.
+def _P(pts, col="c", a=1.0):
+    return ("poly", [(round(x, 2), round(y, 2)) for x, y in pts], col, a)
+
+
+def _C(cx, cy, r, col="c", a=1.0):
+    return ("ell", (cx, cy, r, r), col, a)
+
+
+def _E(cx, cy, rx, ry, col="c", a=1.0):
+    return ("ell", (cx, cy, rx, ry), col, a)
+
+
+def _R(x, y, w, h, col="c", a=1.0):
+    return _P([(x, y), (x + w, y), (x + w, y + h), (x, y + h)], col, a)
+
+
+def _O(cx, cy, rx, ry, sw, col="c", a=1.0):
+    return ("ring", (cx, cy, rx, ry, sw), col, a)
+
+
+def _rot(pts, cx, cy, deg):
+    t = math.radians(deg)
+    c, s = math.cos(t), math.sin(t)
+    return [(cx + (x - cx) * c - (y - cy) * s, cy + (x - cx) * s + (y - cy) * c) for x, y in pts]
+
+
+def _bar(x1, y1, x2, y2, w, col="c", a=1.0):
+    dx, dy = x2 - x1, y2 - y1
+    n = math.hypot(dx, dy) or 1
+    ox, oy = -dy / n * w / 2, dx / n * w / 2
+    return _P([(x1 + ox, y1 + oy), (x2 + ox, y2 + oy), (x2 - ox, y2 - oy), (x1 - ox, y1 - oy)], col, a)
+
+
+def _star(cx, cy, s, col="i", a=.9):
+    q = s * .22
+    return _P([(cx, cy - s), (cx + q, cy - q), (cx + s, cy), (cx + q, cy + q),
+               (cx, cy + s), (cx - q, cy + q), (cx - s, cy), (cx - q, cy - q)], col, a)
+
+
+def _crescent(cx, cy, r, d, tilt=-25, col="c", a=1.0):
+    h = math.sqrt(max(r * r - (d / 2) ** 2, 0))
+    tT, tB = math.atan2(-h, d / 2), math.atan2(h, d / 2)
+    pts = [(cx + r * math.cos(t), cy + r * math.sin(t))
+           for t in (tT + (tB - 2 * math.pi - tT) * i / 40 for i in range(41))]
+    fB, fT = math.atan2(h, -d / 2), math.atan2(-h, -d / 2) + 2 * math.pi
+    pts += [(cx + d + r * math.cos(f), cy + r * math.sin(f)) for f in (fB + (fT - fB) * i / 40 for i in range(41))]
+    return _P(_rot(pts, cx, cy, tilt), col, a)
+
+
+def _heart(cx, cy, s, col="c", a=1.0):
+    pts = []
+    for i in range(60):
+        t = 2 * math.pi * i / 60
+        x = 16 * math.sin(t) ** 3
+        y = -(13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t))
+        pts.append((cx + x * s / 16, cy + y * s / 16))
+    return _P(pts, col, a)
+
+
+def _wave(y0, amp, length, phase=0.0, col="c", a=1.0):
+    pts = [(x, y0 + amp * math.sin(2 * math.pi * (x / length) + phase)) for x in range(-4, 106, 3)]
+    return _P(pts + [(105, 151), (-5, 151)], col, a)
+
+
+def _flame(cx, base, w, h, sway=0.0, col="c", a=1.0):
+    left, right = [], []
+    for i in range(25):
+        f = i / 24
+        hw = w * math.sin(math.pi * f ** 0.6) * (1 - f * .15)
+        x = cx + sway * f * f
+        y = base - h * f
+        left.append((x - hw, y))
+        right.append((x + hw, y))
+    return _P(left + right[::-1], col, a)
+
+
+def _rand(seed, n):
+    """n deterministic numbers in [0, 1) from a seed."""
+    out, x = [], seed or 1
+    for _ in range(n):
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        out.append(x / 0x7FFFFFFF)
+    return out
+
+
+# --- themed designs: each takes a seed and returns a list of shapes
+def m_sunrise(s):
+    out = [_C(50, 112, 30), _R(0, 112, 100, 38, "k", .28)]
+    for y in (97, 103, 108):  # slats across the sun only
+        hw = math.sqrt(30 ** 2 - (112 - y) ** 2)
+        out.append(_R(50 - hw, y, hw * 2, 1.6, "t", .6))
+    return out
+
+
+def m_sunset(s):
+    out = [_C(50, 106, 26)]
+    out += [_R(0, 106 + i * 7, 100, 3.4 - i * .4, "c", .85 - i * .15) for i in range(5)]
+    return out
+
+
+def m_moon(s):
+    r = _rand(s, 12)
+    out = [_crescent(62, 96, 20, 12)]
+    out += [_star(10 + r[i] * 80, 72 + r[i + 6] * 70, 1.6 + r[i] * 1.8) for i in range(6)
+            if not (44 < 10 + r[i] * 80 < 84 and 72 < 72 + r[i + 6] * 70 < 120)]
+    return out
+
+
+def _band(cx, cy, rx, ry, sw, t1, t2, col="c", a=1.0):
+    ts = [t1 + (t2 - t1) * i / 30 for i in range(31)]
+    outer = [(cx + (rx + sw / 2) * math.cos(t), cy + (ry + sw / 2) * math.sin(t)) for t in ts]
+    inner = [(cx + (rx - sw / 2) * math.cos(t), cy + (ry - sw / 2) * math.sin(t)) for t in ts[::-1]]
+    return _P(outer + inner, col, a)
+
+
+def m_space(s):
+    r = _rand(s, 10)
+    out = [_star(8 + r[i] * 84, 66 + r[i + 5] * 80, 1.2 + r[i] * 1.6) for i in range(5)]
+    return out + [_band(52, 104, 33, 7, 2.4, math.pi, 2 * math.pi, "i", .85), _C(52, 104, 18),
+                  _band(52, 104, 33, 7, 2.4, 0, math.pi, "i", .85)]
+
+
+def m_sea(s):
+    return [_wave(100, 3.5, 34, s % 7, "c", .45), _wave(113, 3.5, 30, 1 + s % 5, "c", .7),
+            _wave(127, 3.5, 26, 2 + s % 3, "c", 1.0)]
+
+
+def m_fin(s):
+    return [_wave(108, 2.5, 30, 0, "c", .55), _P([(44, 116), (60, 84), (66, 116)], "k", .55),
+            _wave(116, 3, 26, 1.3, "c", 1.0)]
+
+
+def m_fire(s):
+    return [_flame(30, 150, 13, 52, 4, "c", .7), _flame(70, 150, 13, 48, -5, "c", .7),
+            _flame(50, 152, 17, 70, 3, "c", 1.0), _flame(50, 150, 7, 34, -2, "t", .75)]
+
+
+def m_heart(s):
+    return [_heart(64, 98, 15, "c", .55), _heart(44, 108, 22)]
+
+
+def m_city(s):
+    r = _rand(s, 30)
+    out, x = [], -2
+    i = 0
+    while x < 100:
+        w = 10 + r[i] * 10
+        h = 30 + r[i + 1] * 42
+        out.append(_R(x, 150 - h, w, h, "c", .55 + (i % 2) * .45))
+        if (i % 2):
+            for wy in range(int(150 - h + 5), 146, 7):
+                for wx in (x + 2.5, x + w - 5):
+                    if r[(int(wy) + int(wx)) % 30] > .45:
+                        out.append(_R(wx, wy, 2.4, 3, "t", .65))
+        x += w + .5
+        i += 2
+    return out
+
+
+def m_road(s):
+    out = [_P([(0, 92), (100, 92), (100, 150), (0, 150)], "k", .22),
+           _P([(47, 92), (53, 92), (96, 150), (4, 150)], "k", .35),
+           _C(50, 86, 9, "c", .9)]
+    for i, (y1, y2) in enumerate([(96, 100), (106, 113), (121, 132), (140, 150)]):
+        w1, w2 = .5 + i * .6, .9 + i * .9
+        out.append(_P([(50 - w1, y1), (50 + w1, y1), (50 + w2, y2), (50 - w2, y2)], "c"))
+    return out
+
+
+def m_house(s):
+    return [_R(0, 134, 100, 16, "k", .25), _P([(24, 104), (50, 80), (76, 104)]), _R(29, 103, 42, 32),
+            _R(36, 110, 10, 10, "i", .9), _R(55, 116, 9, 19, "t", .9)]
+
+
+def m_windows(s):
+    r = _rand(s, 12)
+    out = []
+    for row in range(3):
+        for col in range(3):
+            lit = r[row * 3 + col] > .45
+            out.append(_R(16 + col * 24, 72 + row * 24, 18, 19, "c", 1 if lit else .22))
+    return out
+
+
+def m_mountain(s):
+    return [_C(74, 84, 9, "c", .6), _P([(-12, 150), (28, 92), (68, 150)], "c", .55),
+            _P([(22, 150), (62, 76), (108, 150)]), _P([(62, 76), (55.4, 88), (68.8, 88)], "i", .9)]
+
+
+def m_eye(s):
+    top = [(x, 108 - 17 * math.sin(math.pi * (x - 14) / 72)) for x in range(14, 87, 2)]
+    bot = [(x, 108 + 13 * math.sin(math.pi * (x - 14) / 72)) for x in range(86, 13, -2)]
+    return [_P(top + bot), _C(50, 107, 11.5, "t"), _C(50, 107, 5, "c")]
+
+
+def m_birds(s):
+    r = _rand(s, 14)
+    out = []
+    for i in range(6):
+        x, y, z = 14 + r[i] * 72, 74 + r[i + 6] * 62, 5 + r[i] * 5
+        out.append(_P([(x - z, y - z * .4), (x, y), (x + z, y - z * .4), (x + z, y - z * .15),
+                       (x, y + z * .3), (x - z, y - z * .15)], "c", .65 + r[i + 3] * .35))
+    return out
+
+
+def m_forest(s):
+    out = []
+    for x, base, h, a in ((20, 150, 52, .55), (78, 150, 58, .55), (36, 150, 66, 1), (60, 150, 74, 1)):
+        for j in range(3):
+            w = h * (.36 - j * .08)
+            y = base - 8 - j * h * .27
+            out.append(_P([(x - w, y), (x, y - h * .42), (x + w, y)], "c", a))
+        out.append(_R(x - 2, base - 9, 4, 9, "c", a))
+    return out
+
+
+def m_flower(s):
+    cx, cy = 50, 100
+    out = [_bar(50, 112, 50, 152, 2.4, "c", .8)]
+    out += [_C(cx + 11 * math.cos(math.radians(a)), cy + 11 * math.sin(math.radians(a)), 8, "c", .9)
+            for a in range(0, 360, 60)]
+    return out + [_C(cx, cy, 6.5, "i", .95)]
+
+
+def _flake(cx, cy, r):
+    out = []
+    for a in range(0, 180, 60):
+        t = math.radians(a)
+        out.append(_bar(cx - r * math.cos(t), cy - r * math.sin(t), cx + r * math.cos(t), cy + r * math.sin(t), 1.3))
+    return out
+
+
+def m_snow(s):
+    r = _rand(s, 12)
+    out = [_E(50, 164, 82, 30, "c", .95)]
+    for i in range(6):
+        out += _flake(12 + r[i] * 76, 70 + r[i + 6] * 56, 3.5 + r[i] * 4.5)
+    return out
+
+
+def m_storm(s):
+    r = _rand(s, 30)
+    out = [_bar(x, y, x - 6, y + 14, 1, "c", .45) for x, y in ((8 + r[i] * 90, 66 + r[i + 15] * 74) for i in range(14))]
+    return out + [_P([(58, 70), (38, 108), (50, 108), (40, 146), (66, 98), (53, 98), (64, 70)])]
+
+
+def m_drips(s):
+    r = _rand(s, 12)
+    out = [_R(0, 64, 100, 7)]
+    for i in range(7):
+        x = 6 + i * 14.5 + r[i] * 4
+        ln = 10 + r[i + 5] * 50
+        out += [_R(x - 2, 70, 4, ln), _C(x, 70 + ln, 2.6)]
+    return out
+
+
+def m_crosshair(s):
+    return [_O(50, 104, 24, 24, 2.4), _O(50, 104, 10, 10, 1.6, "c", .7),
+            _R(49, 72, 2, 18), _R(49, 118, 2, 18), _R(18, 103, 18, 2), _R(64, 103, 18, 2), _C(50, 104, 2.2)]
+
+
+def m_ghost(s):
+    pts = [(50 + 20 * math.cos(math.radians(a)), 96 + 20 * math.sin(math.radians(a))) for a in range(180, 361, 10)]
+    pts += [(70, 136)] + [(70 - i * 40 / 8, 136 + (4 if i % 2 else -1)) for i in range(1, 9)] + [(30, 96)]
+    return [_P(pts, "c", .92), _E(43, 98, 3, 4.2, "t"), _E(57, 98, 3, 4.2, "t"), _E(50, 111, 3.6, 4.6, "t", .8)]
+
+
+def m_crown(s):
+    return [_P([(24, 124), (24, 92), (37, 106), (50, 84), (63, 106), (76, 92), (76, 124)]),
+            _C(24, 90, 3.4), _C(50, 82, 3.4), _C(76, 90, 3.4), _R(24, 128, 52, 6), _C(50, 113, 3.6, "t", .9)]
+
+
+def m_tracks(s):
+    out = [_P([(48.6, 82), (49.4, 82), (24, 150), (18, 150)]), _P([(50.6, 82), (51.4, 82), (82, 150), (76, 150)])]
+    for i in range(7):
+        f = (i / 6) ** 1.7
+        y = 88 + 62 * f
+        hw = 3 + 34 * f
+        out.append(_R(50 - hw, y, hw * 2, .8 + 2.6 * f, "c", .7))
+    return out
+
+
+def m_record(s):
+    out = [_C(50, 106, 32, "k", .8)]
+    out += [_O(50, 106, rr, rr, .5, "c", .3) for rr in (28, 24, 20, 16)]
+    return out + [_C(50, 106, 10), _C(50, 106, 1.6, "t")]
+
+
+def m_clock(s):
+    out = [_O(50, 104, 25, 25, 3), _C(50, 104, 2.6)]
+    out += [_bar(50 + 20 * math.cos(math.radians(a)), 104 + 20 * math.sin(math.radians(a)),
+                 50 + 23 * math.cos(math.radians(a)), 104 + 23 * math.sin(math.radians(a)), 2) for a in range(0, 360, 30)]
+    return out + [_bar(50, 104, 50, 88, 2.4), _bar(50, 104, 61, 110, 2.4)]
+
+
+def _cloud(cx, cy, s, a):
+    return [_C(cx - s * .9, cy, s * .7, "c", a), _C(cx, cy - s * .35, s, "c", a), _C(cx + s * .95, cy + s * .05, s * .65, "c", a),
+            _R(cx - s * .9, cy, s * 1.85, s * .7, "c", a)]
+
+
+def m_clouds(s):
+    return _cloud(34, 92, 11, .6) + _cloud(62, 118, 15, 1)
+
+
+def m_dunes(s):
+    return [_C(72, 90, 10, "c", .9), _wave(112, 8, 120, 0.4, "c", .55), _wave(128, 7, 90, 2.2, "c", 1.0)]
+
+
+def m_keyhole(s):
+    return [_C(50, 98, 11), _P([(45, 102), (55, 102), (60, 134), (40, 134)])]
+
+
+def m_balloon(s):
+    out = []
+    for cx, cy, r, a in ((34, 100, 11, .7), (62, 92, 13, 1), (50, 112, 9, .55)):
+        out += [_E(cx, cy, r, r * 1.2, "c", a), _bar(cx, cy + r * 1.2, cx + 2, 150, .6, "i", .6)]
+    return out
+
+
+def m_confetti(s):
+    r = _rand(s, 60)
+    out = []
+    for i in range(16):
+        x, y = 6 + r[i] * 88, 66 + r[i + 16] * 80
+        col = "c" if i % 3 else "i"
+        if i % 2:
+            out.append(_C(x, y, 1.6 + r[i + 32] * 1.6, col, .9))
+        else:
+            out.append(_P(_rot([(x - 3, y - 1.2), (x + 3, y - 1.2), (x + 3, y + 1.2), (x - 3, y + 1.2)], x, y, r[i + 40] * 180), col, .9))
+    return out
+
+
+def m_sunburst(s):
+    out = []
+    for i in range(12):
+        a1, a2 = math.radians(180 + i * 15), math.radians(180 + i * 15 + 7.5)
+        out.append(_P([(50, 150), (50 + 140 * math.cos(a1), 150 + 140 * math.sin(a1)),
+                       (50 + 140 * math.cos(a2), 150 + 140 * math.sin(a2))], "c", .32))
+    return out + [_C(50, 150, 16)]
+
+
+def m_swords(s):  # war and battle: crossed swords
+    return [_bar(26, 136, 72, 80, 3.2), _bar(74, 136, 28, 80, 3.2, "c", .75),
+            _bar(30, 120, 40, 130, 2.2), _bar(70, 120, 60, 130, 2.2, "c", .75)]
+
+
+def m_columns(s):
+    out = [_P([(16, 84), (50, 70), (84, 84)]), _R(16, 86, 68, 4), _R(14, 136, 72, 5)]
+    return out + [_R(x, 92, 6, 42, "c", .85) for x in (22, 37, 57, 72)]
+
+
+def m_spiral(s):  # dreams, vertigo
+    pts = []
+    for i in range(140):
+        t = i / 140 * 6 * math.pi
+        rr = 1 + t * 1.45
+        pts.append((50 + rr * math.cos(t), 104 + rr * math.sin(t)))
+    return [_bar(*pts[i], *pts[i + 1], 2.2) for i in range(len(pts) - 1)]
+
+
+def m_bars(s):  # prison, cage
+    return [_R(0, 66, 100, 4)] + [_R(x, 66, 3.5, 84) for x in range(10, 100, 16)]
+
+
+# abstract designs (no theme)
+def a_disc(s): return [_C(50, 96, 21)]
+def a_horizon(s): return [_C(50, 105, 25), _R(0, 105, 100, 45, "k", .2)]
+def a_bands(s): return [_R(0, y, 100, 9) for y in (81, 99, 117)]
+def a_slope(s): return [_P([(100, 45), (100, 150), (0, 150), (0, 138)], "c", .85)]
+def a_rings(s): return [_O(50, 99, rr, rr, 4) for rr in (6, 15, 25, 35)] + [_C(50, 99, 5)]
+def a_dome(s): return [_E(50, 150, 46, 54)]
+def a_beam(s): return [_P([(50, 0), (5, 150), (62, 150)], "c", .43)]
+def a_pair(s): return [_C(37, 96, 21, "c", .82), _C(63, 96, 21, "c", .5)]
+def a_gate(s): return [_R(30, 82, 6, 47), _R(64, 82, 6, 47)]
+def a_stripes(s): return [_bar(x, 160, x + 40, 60, 5, "c", .8) for x in range(-40, 100, 16)]
+def a_dots(s): return [_C(16 + c * 17, 80 + r * 17, 3.6, "c", .9) for r in range(4) for c in range(5)]
+def a_peak(s): return [_P([(10, 140), (50, 72), (90, 140)])]
+def a_arch(s): return [_R(30, 100, 40, 50), _C(50, 100, 20)]
+def a_squares(s): return [_O(50, 108, z, z, 3) for z in (8, 18, 28)]
+def a_zigzag(s): return [_bar(x, 112 + (8 if i % 2 else -8), x + 12.5, 112 + (-8 if i % 2 else 8), 4) for i, x in enumerate(range(-5, 105, 12))]
+def a_scallops(s): return [_C(x, 126, 9) for x in range(0, 110, 18)] + [_R(0, 126, 100, 24)]
+def a_offset(s): return [_C(84, 120, 38, "c", .85), _C(22, 92, 9, "i", .7)]
+def a_split(s): return [_P([(0, 150), (100, 70), (100, 150)], "c", .45), _C(40, 104, 16)]
+
+
+def a_checker(s):
+    return [_R(c * 12.5, 110 + r * 12.5, 12.5, 12.5) for r in range(3) for c in range(8) if (r + c) % 2]
+
+
+ABSTRACT = [a_disc, a_horizon, a_bands, a_slope, a_rings, a_dome, a_beam, a_pair, a_gate, a_stripes, a_dots,
+            a_peak, a_arch, a_squares, a_zigzag, a_scallops, a_offset, a_split, a_checker, m_sunburst]
+
+# title words -> (design, palettes that suit it)
+THEMES = [
+    (("sunrise", "dawn", "morning"), m_sunrise, ("dusk", "gold", "blush", "plum")),
+    (("sunset", "dusk", "evening", "summer", "sun", "sunshine", "day", "days"), m_sunset, ("dusk", "rust", "brick", "plum", "gold")),
+    (("moon", "moonlight", "moonrise", "night", "nights", "midnight", "dark", "darkness", "nocturnal", "sleep", "sleepless"),
+     m_moon, ("ink", "navy", "plum", "slate")),
+    (("star", "stars", "space", "planet", "galaxy", "interstellar", "mars", "alien", "aliens", "solaris", "gravity",
+      "moonfall", "orbit", "cosmos", "universe", "apollo", "astronaut", "odyssey", "arrival", "martian"),
+     m_space, ("ink", "navy", "plum", "noir")),
+    (("jaws", "shark", "sharks"), m_fin, ("ocean", "teal", "navy")),
+    (("sea", "ocean", "water", "waters", "river", "lake", "island", "beach", "wave", "waves", "boat", "ship", "titanic",
+      "sail", "lighthouse", "surf", "tide", "deep", "swim", "swimming", "pool", "flood", "harbour", "bay"),
+     m_sea, ("ocean", "teal", "slate", "navy")),
+    (("fire", "fires", "burn", "burning", "flame", "flames", "heat", "hell", "inferno", "blaze", "smoke", "hot", "volcano"),
+     m_fire, ("noir", "brick", "blood", "rust")),
+    (("love", "lovers", "heart", "hearts", "kiss", "romance", "valentine", "darling", "sweetheart", "marriage", "wedding",
+      "bride", "honey", "crush", "amour", "amelie", "her", "notebook"),
+     m_heart, ("rose", "blush", "brick", "plum")),
+    (("city", "new york", "manhattan", "paris", "london", "tokyo", "rome", "berlin", "chicago", "los angeles",
+      "street", "streets", "metropolis", "downtown", "town", "brooklyn", "hong kong", "vegas", "detroit", "gotham",
+      "skyfall", "broadway"),
+     m_city, ("navy", "ink", "slate", "noir", "dusk")),
+    (("road", "drive", "driver", "highway", "car", "cars", "taxi", "ride", "journey", "trip", "route", "speed",
+      "rush", "miles", "travel", "travels", "easy rider", "thelma"),
+     m_road, ("dusk", "sand", "rust", "gold")),
+    (("train", "trains", "express", "station", "railway", "snowpiercer", "locomotive"), m_tracks, ("rust", "slate", "noir", "paper")),
+    (("house", "home", "hotel", "mansion", "cabin", "cottage", "castle", "manor", "motel", "lodge"),
+     m_house, ("navy", "moss", "plum", "slate")),
+    (("apartment", "window", "windows", "room", "rooms", "rear window", "neighbours", "neighbors", "building", "tower"),
+     m_windows, ("navy", "ink", "noir", "slate")),
+    (("mountain", "mountains", "hill", "hills", "peak", "valley", "everest", "summit", "climb", "alps", "brokeback", "cliff"),
+     m_mountain, ("slate", "navy", "moss", "pine")),
+    (("eye", "eyes", "see", "seeing", "look", "looking", "watch", "watcher", "watching", "vision", "witness", "blind",
+      "spy", "gaze", "stare", "peeping", "seen", "observer", "surveillance", "vertigo"),
+     m_eye, ("noir", "plum", "teal", "gold")),
+    (("bird", "birds", "wings", "fly", "flying", "flight", "eagle", "crow", "raven", "hawk", "dove", "swan", "sparrow",
+      "mockingbird", "birdman", "cuckoo", "goose", "heron"),
+     m_birds, ("frost", "paper", "slate", "dusk")),
+    (("tree", "trees", "forest", "woods", "wood", "jungle", "wild", "wilderness", "grove", "pine", "garden", "princess mononoke"),
+     m_forest, ("pine", "moss", "mint", "teal")),
+    (("flower", "flowers", "rose", "roses", "lily", "blossom", "bloom", "petal", "daisy", "orchid", "lotus", "tulip", "midsommar"),
+     m_flower, ("blush", "rose", "moss", "mint")),
+    (("snow", "winter", "frozen", "ice", "cold", "christmas", "xmas", "frost", "blizzard", "fargo", "arctic", "polar", "thing"),
+     m_snow, ("frost", "slate", "ink")),
+    (("rain", "storm", "storms", "thunder", "lightning", "tornado", "twister", "hurricane", "tempest", "weather"),
+     m_storm, ("slate", "ink", "navy", "noir")),
+    (("blood", "bloody", "scream", "massacre", "chainsaw", "slasher", "carrie", "evil", "devil", "hereditary", "saw",
+      "terror", "horror", "zombie", "zombies", "undead", "vampire", "dracula"),
+     m_drips, ("blood", "noir", "paper")),
+    (("kill", "killer", "killers", "killing", "murder", "murders", "gun", "guns", "shot", "shoot", "shooter", "hitman",
+      "assassin", "bullet", "sniper", "target", "heist", "gangster", "godfather", "goodfellas", "mafia", "crime", "wick"),
+     m_crosshair, ("noir", "blood", "slate", "paper")),
+    (("ghost", "ghosts", "haunt", "haunted", "haunting", "spirit", "spirited", "spirits", "phantom", "poltergeist",
+      "shining", "conjuring", "others", "boo", "spectre"),
+     m_ghost, ("ink", "plum", "teal", "slate")),
+    (("king", "kings", "queen", "queens", "prince", "princess", "crown", "royal", "empire", "kingdom", "emperor",
+      "throne", "lord", "duchess", "favourite", "favorite", "monarch"),
+     m_crown, ("plum", "rose", "noir", "gold")),
+    (("music", "song", "songs", "sing", "singing", "dance", "dancing", "jazz", "rock", "band", "melody", "musical",
+      "record", "whiplash", "la la land", "disco", "opera", "concert", "piano", "drum", "beat", "soul"),
+     m_record, ("gold", "dusk", "plum", "rose")),
+    (("time", "clock", "hour", "hours", "minute", "minutes", "tomorrow", "yesterday", "today", "forever", "past",
+      "future", "back to the future", "memento", "tenet", "looper", "groundhog", "noon"),
+     m_clock, ("paper", "slate", "mint", "gold")),
+    (("cloud", "clouds", "sky", "skies", "heaven", "heavens", "air", "angel", "angels", "wind", "breath"),
+     m_clouds, ("mint", "frost", "navy", "dusk")),
+    (("dream", "dreams", "dreaming", "dreamer", "inception", "hypnosis", "trance", "mind", "madness", "insomnia",
+      "spiral", "twisted"),
+     m_spiral, ("plum", "teal", "noir", "dusk")),
+    (("desert", "dune", "dunes", "sand", "arabia", "sahara", "mirage", "oasis", "western", "outlaw", "cowboy", "cowboys",
+      "west", "texas", "mexico", "arizona"),
+     m_dunes, ("sand", "rust", "dusk", "gold")),
+    (("secret", "secrets", "mystery", "key", "keys", "door", "doors", "lock", "locked", "hidden", "knives", "clue",
+      "riddle", "puzzle", "enigma", "zodiac", "gone", "prisoners"),
+     m_keyhole, ("noir", "slate", "paper", "plum")),
+    (("prison", "jail", "cage", "escape", "shawshank", "alcatraz", "captive", "trapped"), m_bars, ("slate", "noir", "paper")),
+    (("war", "battle", "battles", "soldier", "soldiers", "sword", "swords", "army", "warrior", "warriors", "samurai",
+      "knight", "knights", "gladiator", "dunkirk", "1917", "troy", "spartacus"),
+     m_swords, ("rust", "noir", "slate", "paper")),
+    (("party", "birthday", "celebration", "fun", "funny", "comedy", "laugh", "carnival", "circus", "festival"),
+     m_confetti, ("gold", "rose", "teal", "blush")),
+    (("balloon", "balloons", "up", "paddington", "toy", "toys", "kid", "kids", "child", "children", "family"),
+     m_balloon, ("rose", "mint", "gold", "navy")),
+    (("rome", "athens", "greek", "god", "gods", "temple", "ancient", "history", "senate", "republic", "olympus"),
+     m_columns, ("paper", "sand", "slate", "rust")),
 ]
-MOTIFS = [
-    "radial-gradient(circle at 50% 64%, {c} 0 21%, #0000 21.6%)",
-    "linear-gradient(180deg, #0000 70%, #0003 70%), radial-gradient(circle at 50% 70%, {c} 0 24%, #0000 24.6%)",
-    "linear-gradient(180deg, #0000 54%, {c} 54% 60%, #0000 60% 66%, {c} 66% 72%, #0000 72% 78%, {c} 78% 84%, #0000 84%)",
-    "linear-gradient(140deg, #0000 56%, {c}D9 56%)",
-    "radial-gradient(circle at 50% 66%, {c} 0 4%, #0000 4% 9%, {c} 9% 12%, #0000 12% 17%, {c} 17% 20%, #0000 20% 25%, {c} 25% 28%, #0000 28%)",
-    "radial-gradient(ellipse 46% 36% at 50% 100%, {c} 0 99%, #0000 100%)",
-    "conic-gradient(from 155deg at 50% 0%, #0000 0deg, {c}66 22deg 50deg, #0000 50deg)",
-    "radial-gradient(circle at 37% 64%, {c}D0 0 19%, #0000 19.6%), radial-gradient(circle at 63% 64%, {c}80 0 19%, #0000 19.6%)",
-    "linear-gradient(90deg, #0000 30%, {c} 30% 36%, #0000 36% 64%, {c} 64% 70%, #0000 70%) 0 72% / 100% 46% no-repeat",
-]
+_THEME_WORDS = {}
+for _words, _fn, _pals in THEMES:
+    for _w in _words:
+        _THEME_WORDS.setdefault(_w, (_fn, _pals))
+
+GENRE_THEMES = {
+    "Horror": [(m_drips, ("blood", "noir")), (m_ghost, ("ink", "plum")), (m_eye, ("noir", "blood"))],
+    "Science Fiction": [(m_space, ("ink", "navy", "plum"))],
+    "Romance": [(m_heart, ("rose", "blush", "plum"))],
+    "Crime": [(m_crosshair, ("noir", "slate", "paper")), (m_windows, ("noir", "ink"))],
+    "Thriller": [(m_eye, ("noir", "slate", "plum")), (m_keyhole, ("noir", "slate"))],
+    "Mystery": [(m_keyhole, ("noir", "slate", "plum"))],
+    "Western": [(m_dunes, ("sand", "rust", "dusk"))],
+    "War": [(m_swords, ("rust", "slate", "noir"))],
+    "Music": [(m_record, ("gold", "dusk", "plum"))],
+    "Animation": [(m_clouds, ("mint", "frost", "dusk")), (m_balloon, ("rose", "mint", "gold"))],
+    "Family": [(m_balloon, ("rose", "mint", "gold")), (m_clouds, ("mint", "frost"))],
+    "Fantasy": [(m_moon, ("plum", "ink", "navy")), (m_crown, ("plum", "rose"))],
+    "Adventure": [(m_mountain, ("slate", "pine", "moss")), (m_road, ("dusk", "sand"))],
+    "History": [(m_columns, ("paper", "sand", "slate")), (m_crown, ("plum", "noir"))],
+    "Comedy": [(m_confetti, ("gold", "rose", "teal", "blush"))],
+}
+GENRE_ORDER = ["Horror", "Science Fiction", "Western", "War", "Music", "Animation", "Romance", "Crime", "Mystery",
+               "Thriller", "Fantasy", "History", "Family", "Adventure", "Comedy"]
+
+
+def _theme_for(name):
+    words = title_key(name).split()
+    text = " " + " ".join(words) + " "
+    for phrase, hit in _THEME_WORDS.items():  # multi-word phrases first
+        if " " in phrase and f" {phrase} " in text:
+            return hit
+    for w in words:
+        if w in _THEME_WORDS:
+            return _THEME_WORDS[w]
+    for w in words:  # compound words: "aftersun", "moonstruck", "nightcrawler"
+        for stem in ("sunrise", "sunset", "sun", "moon", "night", "star", "fire", "snow", "rain", "blood", "heart", "love"):
+            if len(w) > len(stem) + 2 and (w.startswith(stem) or w.endswith(stem)):
+                if stem == "rain" and "train" in w:
+                    continue
+                return _THEME_WORDS[stem]
+    return None
+
+
+def poster_design(k, name, genres=()):
+    """Pick the design and palette for a film: title first, then genre, then a hash."""
+    h = zlib.crc32(str(k).encode())
+    hit = _theme_for(name)
+    if not hit:
+        for g in GENRE_ORDER:
+            if g in (genres or ()):
+                options = GENRE_THEMES[g]
+                hit = options[h % len(options)]
+                break
+    if hit:
+        fn, pals = hit
+        pal = pals[(h // 7) % len(pals)]
+    else:
+        fn = ABSTRACT[(h // 13) % len(ABSTRACT)]
+        pal = ALL_PALETTES[h % len(ALL_PALETTES)]
+    return fn, pal, h
+
+
+def _shape_colour(col, palette):
+    top, bottom, c, ink = PALETTES[palette]
+    return {"c": c, "i": ink, "k": "#000000", "t": top}.get(col, col)
+
+
+@functools.lru_cache(maxsize=4096)
+def poster_svg(k, name, genres=(), avoid_gold=False):
+    """(css background, text colour) for the generated poster."""
+    fn, pal, h = poster_design(k, name, genres)
+    if avoid_gold and pal == "gold":
+        pal = "dusk"
+    top, bottom, _, ink = PALETTES[pal]
+    parts = []
+    for kind, data, col, a in fn(h):
+        fill = _shape_colour(col, pal)
+        op = f' fill-opacity="{a:g}"' if a < 1 else ""
+        if kind == "poly":
+            pts = " ".join(f"{x:g},{y:g}" for x, y in data)
+            parts.append(f"<polygon points='{pts}' fill='{fill}'{op}/>")
+        elif kind == "ell":
+            cx, cy, rx, ry = data
+            parts.append(f"<ellipse cx='{cx:g}' cy='{cy:g}' rx='{rx:g}' ry='{ry:g}' fill='{fill}'{op}/>")
+        else:
+            cx, cy, rx, ry, sw = data
+            sop = f' stroke-opacity="{a:g}"' if a < 1 else ""
+            parts.append(f"<ellipse cx='{cx:g}' cy='{cy:g}' rx='{rx:g}' ry='{ry:g}' fill='none' stroke='{fill}' "
+                         f"stroke-width='{sw:g}'{sop}/>")
+    svg = ("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 150' preserveAspectRatio='xMidYMax slice'>"
+           + "".join(parts) + "</svg>")
+    uri = "data:image/svg+xml," + urllib.parse.quote(svg, safe="=:/,.-")
+    return f"url({uri}) center bottom / 100% 100% no-repeat, linear-gradient(170deg,{top},{bottom})", ink
+
+
+def draw_poster_art(img, k, name, genres=()):
+    """Draw the same design onto a Pillow image (share images)."""
+    fn, pal, h = poster_design(k, name, genres)
+    w, ht = img.size
+    S = 2  # draw at double size, then shrink, for smooth edges
+    sx, sy = w * S / 100, ht * S / 150
+    layer = Image.new("RGBA", (w * S, ht * S), (0, 0, 0, 0))
+    for kind, data, col, a in fn(h):
+        shape = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+        d = ImageDraw.Draw(shape)
+        rgb = _hex(_shape_colour(col, pal))
+        fill = rgb + (int(255 * a),)
+        if kind == "poly":
+            d.polygon([(x * sx, y * sy) for x, y in data], fill=fill)
+        elif kind == "ell":
+            cx, cy, rx, ry = data
+            d.ellipse([(cx - rx) * sx, (cy - ry) * sy, (cx + rx) * sx, (cy + ry) * sy], fill=fill)
+        else:
+            cx, cy, rx, ry, sw = data
+            d.ellipse([(cx - rx - sw / 2) * sx, (cy - ry - sw / 2) * sy, (cx + rx + sw / 2) * sx, (cy + ry + sw / 2) * sy],
+                      outline=fill, width=max(1, int(sw * sx)))
+        layer = Image.alpha_composite(layer, shape)
+    layer = layer.resize((w, ht), Image.LANCZOS)
+    base = img.convert("RGBA")
+    base.alpha_composite(layer)
+    return base.convert("RGB"), PALETTES[pal]
 
 
 def poster(k, size="md", link=True) -> str:
@@ -409,15 +1018,21 @@ def poster(k, size="md", link=True) -> str:
     return poster_html(k, r["Name"], year_str(r["Year"]), r["Letterboxd URI"], size, link)
 
 
+def _known_genres(name, year, k=None) -> tuple:
+    """Genres if this film's details are already loaded (never fetches)."""
+    if not year and k and "|" in str(k):  # swipe cards hide the year, but the key still has it
+        year = str(k).rsplit("|", 1)[1]
+    try:
+        hit = _film_store()["films"].get(f"{title_key(name)}|{_norm_year(year)}")
+    except Exception:
+        return ()
+    return tuple((hit[1] or {}).get("genres") or ()) if hit else ()
+
+
 def poster_html(k, name, year, uri, size="md", link=True) -> str:
-    """A tiny screen-printed 'poster' generated from the film's title, so every film has art."""
-    h = zlib.crc32(str(k).encode())
-    i = h % len(PALETTES)
-    if size == "lg" and PALETTES[i][0] == GOLD:  # don't put a gold poster on the gold ticket
-        i = (i + 1) % len(PALETTES)
-    top, bottom, c, ink = PALETTES[i]
-    motif = MOTIFS[(h // 13) % len(MOTIFS)].format(c=c)
-    style = f"--pi:{ink};background:{motif},linear-gradient(170deg,{top},{bottom})"
+    """A screen-printed 'poster' generated from the film's title (and genre), so every film has art."""
+    bg, ink = poster_svg(str(k), str(name), _known_genres(name, year, k), avoid_gold=(size == "lg"))
+    style = f"--pi:{ink};background:{bg}"
     inner = f'<span class="p-t">{esc(str(name))}</span><span class="p-y">{esc(str(year or ""))}</span>'
     real = real_poster_url(k, size)
     if real:  # the film's actual poster, over the generated art in case the image is slow
@@ -513,11 +1128,14 @@ def marquee(kicker: str, title: str, sub: str):
 
 # ---------- Tickets ----------
 
-def ticket(k, name, year, uri, why_html: str, kicker: str = "Tonight's feature", flip: str = "a") -> str:
+NUM_WORDS = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"]
+
+
+def ticket(k, name, year, uri, why_html: str, kicker: str = "Tonight's feature", flip: str = "a", admit: int = 2) -> str:
     link = (f'<a class="tk-link" href="{esc(str(uri))}" target="_blank">Open on Letterboxd →</a>'
             if uri and pd.notna(uri) else "")
     serial = f"No. {zlib.crc32(str(k).encode()) % 900000 + 100000}"
-    return (f'<div class="ticket {flip}"><div class="tk-stub"><span>Admit two</span><small>{serial}</small></div>'
+    return (f'<div class="ticket {flip}"><div class="tk-stub"><span>Admit {NUM_WORDS[admit] if 0 < admit < len(NUM_WORDS) else admit}</span><small>{serial}</small></div>'
             f'<div class="tk-main"><div class="tk-kick">{kicker}</div>'
             f'<div class="tk-body">{poster_html(k, name, year, uri, "lg", link=False)}<div style="min-width:0">'
             f'<div class="tk-title">{esc(str(name))}</div><div class="tk-year">{esc(str(year or ""))}</div>'
@@ -792,48 +1410,18 @@ def _wrap(draw, text, font, max_w, max_lines):
     return lines
 
 
-def _poster_image(k, name, w, h):
+def _poster_image(k, name, w, h, year=None):
     """The same screen-print poster as in the app, drawn with Pillow."""
-    hh = zlib.crc32(str(k).encode())
-    top, bottom, c, ink = (_hex(x) for x in PALETTES[hh % len(PALETTES)])
-    motif = (hh // 13) % len(MOTIFS)
+    genres = _known_genres(name, year, k)
+    _, pal, _ = poster_design(str(k), str(name), genres)
+    top, bottom, _, ink = (_hex(x) for x in PALETTES[pal])
     img = Image.new("RGB", (w, h))
     d = ImageDraw.Draw(img)
     for y in range(h):  # vertical gradient
         t = y / h
         d.line([(0, y), (w, y)], fill=tuple(int(a + (b - a) * t) for a, b in zip(top, bottom)))
-    cx, r = w / 2, w * 0.27
-    if motif == 0:
-        d.ellipse([cx - r, h * .64 - r, cx + r, h * .64 + r], fill=c)
-    elif motif == 1:
-        d.ellipse([cx - r * 1.1, h * .70 - r * 1.1, cx + r * 1.1, h * .70 + r * 1.1], fill=c)
-        shade = Image.new("RGBA", (w, int(h * .30)), (0, 0, 0, 50))
-        img.paste(shade, (0, int(h * .70)), shade)
-    elif motif == 2:
-        for a, b in ((.54, .60), (.66, .72), (.78, .84)):
-            d.rectangle([0, h * a, w, h * b], fill=c)
-    elif motif == 3:
-        d.polygon([(w, h * .30), (w, h), (0, h), (0, h * .92)], fill=c)
-    elif motif == 4:
-        for i, rr in enumerate((.04, .12, .20, .28)):
-            R = w * rr * 1.25
-            d.ellipse([cx - R, h * .66 - R, cx + R, h * .66 + R], outline=c, width=max(3, int(w * .035)))
-        d.ellipse([cx - w * .05, h * .66 - w * .05, cx + w * .05, h * .66 + w * .05], fill=c)
-    elif motif == 5:
-        d.ellipse([w * .04, h * .64, w * .96, h * 1.36], fill=c)
-    elif motif == 6:
-        cone = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        ImageDraw.Draw(cone).polygon([(cx, 0), (w * .05, h), (w * .62, h)], fill=c + (110,))
-        img.paste(cone, (0, 0), cone)
-    elif motif == 7:
-        two = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        dd = ImageDraw.Draw(two)
-        dd.ellipse([w * .37 - r * .95, h * .64 - r * .95, w * .37 + r * .95, h * .64 + r * .95], fill=c + (210,))
-        dd.ellipse([w * .63 - r * .95, h * .64 - r * .95, w * .63 + r * .95, h * .64 + r * .95], fill=c + (130,))
-        img.paste(two, (0, 0), two)
-    else:
-        d.rectangle([w * .30, h * .40, w * .36, h * .86], fill=c)
-        d.rectangle([w * .64, h * .40, w * .70, h * .86], fill=c)
+    img, _ = draw_poster_art(img, str(k), str(name), genres)
+    d = ImageDraw.Draw(img)
     f = _font("fraunces-600", int(w * .11))
     y = int(h * .07)
     for line in _wrap(d, name, f, w * .82, 4):
@@ -903,7 +1491,7 @@ def share_film_png(kicker, names_line, k, name, year, meta, stream, poster_url="
     ImageDraw.Draw(shadow).rounded_rectangle([60, 80, pw + 60, ph + 80], radius=24, fill=(0, 0, 0, 170))
     shadow = shadow.filter(ImageFilter.GaussianBlur(28))
     img.paste(shadow, (int(W / 2 - pw / 2 - 60), 250 - 60), shadow)
-    poster_ = (_fetch_poster(poster_url, pw, ph) if poster_url else None) or _poster_image(k, name, pw, ph)
+    poster_ = (_fetch_poster(poster_url, pw, ph) if poster_url else None) or _poster_image(k, name, pw, ph, year)
     img.paste(poster_, (int(W / 2 - pw / 2), 250), poster_)
     y = 950
     ft = _font("fraunces-600", 66)
@@ -2053,7 +2641,8 @@ def group_view(code, mid):
             region = current_region()
             wi = film_infos([(win["key"], win["name"], win["year"])]).get(win["key"])
             md(ticket(win["key"], win["name"], win["year"], win["uri"],
-                      esc(by_names(room, win)) + info_lines_html(wi, region), kicker="Group favourite"))
+                      esc(by_names(room, win)) + info_lines_html(wi, region), kicker="Group favourite",
+                      admit=len(room["members"])))
             share_button(lambda: share_film_png("Group favourite", f"{host}'s movie night", win["key"], win["name"],
                                         win["year"], details_text(wi), stream_text(wi, region),
                                         real_poster_url(win["key"], "xl")),
