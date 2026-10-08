@@ -1,7 +1,11 @@
 """Double Feature: compare two Letterboxd accounts and pick a film together."""
 
+import base64
+import concurrent.futures
+import functools
 import html
 import io
+import os
 import random
 import re
 import secrets
@@ -12,10 +16,13 @@ import unicodedata
 import urllib.parse
 import zipfile
 import zlib
+from pathlib import Path
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 st.set_page_config(page_title="Double Feature", page_icon="🎟️", layout="centered",
                    initial_sidebar_state="collapsed")
@@ -220,6 +227,9 @@ button[data-variant="pills"][aria-pressed="true"], button[data-variant="segmente
   font-variation-settings: "SOFT" 100, "WONK" 1; letter-spacing: -.005em; }
 .p-y { font-family: var(--label); letter-spacing: .14em; margin-top: auto; padding: 0 9% 7%; opacity: .85; }
 .p-sm { width: 44px; flex: 0 0 44px; border-radius: 4px; }
+.poster.real img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; }
+.poster.real:before { z-index: 2; }
+.sw-title { font-family: var(--display); font-size: 1.15rem; font-weight: 600; line-height: 1.15; margin-top: .1rem; }
 .p-sm .p-t, .p-sm .p-y { display: none; }
 .p-md .p-t { font-size: .82rem; } .p-md .p-y { font-size: .72rem; }
 .p-lg { width: 92px; flex: 0 0 92px; } .p-lg .p-t { font-size: .8rem; } .p-lg .p-y { font-size: .7rem; }
@@ -409,6 +419,10 @@ def poster_html(k, name, year, uri, size="md", link=True) -> str:
     motif = MOTIFS[(h // 13) % len(MOTIFS)].format(c=c)
     style = f"--pi:{ink};background:{motif},linear-gradient(170deg,{top},{bottom})"
     inner = f'<span class="p-t">{esc(str(name))}</span><span class="p-y">{esc(str(year or ""))}</span>'
+    real = real_poster_url(k, size)
+    if real:  # the film's actual poster, over the generated art in case the image is slow
+        size += " real"
+        inner = f'<img src="{esc(real)}" alt="{esc(str(name))}" loading="lazy">'
     if link and pd.notna(uri) and uri:
         return f'<a class="poster p-{size}" style="{style}" href="{esc(str(uri))}" target="_blank">{inner}</a>'
     return f'<div class="poster p-{size}" style="{style}">{inner}</div>'
@@ -508,6 +522,486 @@ def ticket(k, name, year, uri, why_html: str, kicker: str = "Tonight's feature",
             f'<div class="tk-body">{poster_html(k, name, year, uri, "lg", link=False)}<div style="min-width:0">'
             f'<div class="tk-title">{esc(str(name))}</div><div class="tk-year">{esc(str(year or ""))}</div>'
             f'<div class="tk-why">{why_html}</div></div></div>{link}</div></div>')
+
+
+# ---------- Film details and streaming (optional, from TMDB) ----------
+# Runtime, genres and where each film is streaming. Needs a free TMDB key in Streamlit secrets
+# (TMDB_API_KEY). Without one, everything else works and these extras simply don't appear.
+
+TMDB_API = "https://api.themoviedb.org/3"
+DETAIL_TTL = 7 * 24 * 3600
+FAKE_TMDB = os.environ.get("DOUBLE_FEATURE_FAKE_TMDB") == "1"  # offline testing only
+REGIONS = {"GB": "UK", "IE": "Ireland", "US": "USA", "CA": "Canada", "AU": "Australia", "NZ": "New Zealand",
+           "DE": "Germany", "FR": "France", "ES": "Spain", "IT": "Italy", "NL": "Netherlands", "BE": "Belgium",
+           "SE": "Sweden", "DK": "Denmark", "NO": "Norway", "PT": "Portugal", "IN": "India", "JP": "Japan",
+           "SG": "Singapore", "ZA": "South Africa"}
+
+
+def _secret(name):
+    try:
+        val = st.secrets.get(name)
+    except Exception:  # no secrets file at all
+        val = None
+    return val or os.environ.get(name)
+
+
+def tmdb_on() -> bool:
+    return FAKE_TMDB or bool(_secret("TMDB_API_KEY"))
+
+
+def current_region() -> str:
+    if st.session_state.get("region") in REGIONS:
+        return st.session_state.region
+    loc = (st.context.locale or "") if hasattr(st.context, "locale") else ""
+    cc = loc.replace("_", "-").split("-")[-1].upper() if "-" in loc.replace("_", "-") else ""
+    return cc if cc in REGIONS else "GB"
+
+
+POSTER_URLS = {}  # film key -> TMDB poster path, filled as film details arrive this run
+POSTER_WIDTHS = {"sm": "w154", "md": "w342", "lg": "w342", "xl": "w500"}
+
+
+def want_real_posters() -> bool:
+    return tmdb_on() and st.session_state.get("poster_style") == "real"
+
+
+def remember_posters(infos):
+    for k, i in (infos or {}).items():
+        if i and i.get("poster"):
+            POSTER_URLS[k] = i["poster"]
+
+
+def real_poster_url(k, size="md"):
+    path = POSTER_URLS.get(k) if st.session_state.get("poster_style") == "real" else None
+    if not path:
+        return ""
+    if FAKE_TMDB:  # offline testing: a plain coloured stand-in
+        col = ["#8a3b2e", "#2e5a8a", "#3b8a4e", "#6b3b8a", "#8a7a2e", "#2e7a8a", "#444"][int(path[5]) % 7]
+        return ("data:image/svg+xml;utf8," + urllib.parse.quote(
+            f"<svg xmlns='http://www.w3.org/2000/svg' width='200' height='300'><rect width='200' height='300' "
+            f"fill='{col}'/><text x='20' y='280' fill='white' font-size='22' font-family='sans-serif'>REAL</text></svg>"))
+    return f"https://image.tmdb.org/t/p/{POSTER_WIDTHS.get(size.split()[0], 'w342')}{path}"
+
+
+def prefetch_posters(items):
+    """When real posters are switched on, look up the films about to be shown."""
+    if want_real_posters() and items:
+        remember_posters(film_infos(items))
+
+
+def settings_menu():
+    """Per-person settings: poster style and streaming country."""
+    with st.popover("Settings", icon=":material/tune:"):
+        if tmdb_on():
+            st.segmented_control("Posters", ["art", "real"], default="art",
+                                 key="poster_style", format_func={"art": "Minimal art", "real": "Real posters"}.get)
+            region = current_region()
+            st.selectbox("Streaming in", list(REGIONS), index=list(REGIONS).index(region),
+                          format_func=REGIONS.get, key="region")
+        else:
+            st.caption("Real posters and streaming info appear here once film details are switched on "
+                       "(see the README).")
+
+
+@st.cache_resource
+def _film_store():
+    return {"lock": threading.Lock(), "films": {}}
+
+
+def _tmdb_get(path, **params):
+    key = str(_secret("TMDB_API_KEY") or "")
+    headers = {"accept": "application/json"}
+    if key.startswith("eyJ"):  # the long "API read access token"
+        headers["Authorization"] = f"Bearer {key}"
+    else:                      # the short "API key"
+        params["api_key"] = key
+    try:
+        r = requests.get(TMDB_API + path, params=params, headers=headers, timeout=6)
+        return r.json() if r.ok else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def _clean_service(name: str) -> str:
+    for junk in (" Standard with Ads", " with Ads", " Amazon Channel", " Apple TV Channel"):
+        name = name.replace(junk, "")
+    return name.replace("Amazon Prime Video", "Prime Video").replace("Apple TV Plus", "Apple TV+") \
+               .replace("Disney Plus", "Disney+")
+
+
+def _fake_info(name, year):
+    h = zlib.crc32(f"{name}|{year}".encode())
+    genres = ["Drama", "Comedy", "Thriller", "Romance", "Horror", "Sci-Fi", "Animation", "Crime", "Documentary"]
+    services = ["Netflix", "Prime Video", "MUBI", "BBC iPlayer", "Disney+", "Apple TV+"]
+    stream = [services[(h >> s) % len(services)] for s in (3, 9)][: (h % 3)]
+    return {"id": h % 100000, "poster": f"/fake{h % 7}.jpg", "runtime": 80 + h % 100, "genres": [genres[h % 9], genres[(h // 9) % 9]][: 1 + h % 2],
+            "providers": {cc: {"stream": sorted(set(stream)), "rent": bool(h % 2), "link": ""} for cc in REGIONS}}
+
+
+def _fetch_info(name, year):
+    """Look a film up on TMDB. Returns a dict, {} if not found, or None if TMDB couldn't be reached."""
+    if FAKE_TMDB:
+        return _fake_info(name, year)
+    res = _tmdb_get("/search/movie", query=name, primary_release_year=year) if year else None
+    if not res or not res.get("results"):
+        res = _tmdb_get("/search/movie", query=name)
+    if res is None:
+        return None
+    hits = res.get("results") or []
+    if not hits:
+        return {}
+    want = title_key(name)
+
+    def rank(h):
+        same = want in (title_key(h.get("title", "")), title_key(h.get("original_title", "")))
+        y = (h.get("release_date") or "")[:4]
+        off = abs(int(y) - int(year)) if (year and y.isdigit()) else 5
+        return (not same, off, -(h.get("popularity") or 0))
+
+    best = sorted(hits, key=rank)[0]
+    det = _tmdb_get(f"/movie/{best['id']}") or {}
+    prov = (_tmdb_get(f"/movie/{best['id']}/watch/providers") or {}).get("results") or {}
+    providers = {}
+    for cc, v in prov.items():
+        streams = sorted(v.get("flatrate", []) + v.get("free", []) + v.get("ads", []),
+                         key=lambda p: p.get("display_priority", 99))
+        names = list(dict.fromkeys(_clean_service(p.get("provider_name", "")) for p in streams if p.get("provider_name")))
+        providers[cc] = {"stream": names, "rent": bool(v.get("rent") or v.get("buy")), "link": v.get("link") or ""}
+    return {"id": best["id"], "poster": best.get("poster_path") or det.get("poster_path"),
+            "runtime": det.get("runtime") or None,
+            "genres": [g["name"] for g in det.get("genres", [])][:3], "providers": providers}
+
+
+def film_infos(items, limit=150):
+    """items: [(key, name, year)]. Returns {key: info}, fetching anything new in parallel."""
+    if not tmdb_on() or not items:
+        return {}
+    store, now, out, todo = _film_store(), time.time(), {}, []
+    offline = store.get("down_until", 0) > now  # TMDB failing (bad key or outage): don't keep retrying
+    for k, name, year in items:
+        y = _norm_year(year)
+        ck = f"{title_key(name)}|{y}"
+        hit = store["films"].get(ck)
+        if hit and now - hit[0] < DETAIL_TTL:
+            out[k] = hit[1]
+        else:
+            todo.append((k, name, y, ck))
+    todo = [] if offline else todo[:limit]
+    if todo:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool_:
+            results = list(pool_.map(lambda t: _fetch_info(t[1], t[2]), todo))
+        with store["lock"]:
+            if len(store["films"]) > 5000:
+                store["films"].clear()
+            for (k, _, _, ck), info in zip(todo, results):
+                if info is not None:
+                    store["films"][ck] = (now, info)
+                    out[k] = info
+            if all(r is None for r in results):
+                store["down_until"] = now + 600  # try again in 10 minutes
+    return out
+
+
+def fmt_runtime(m) -> str:
+    if not m:
+        return ""
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def details_text(info) -> str:
+    if not info:
+        return ""
+    return " · ".join(x for x in (fmt_runtime(info.get("runtime")), ", ".join(info.get("genres", [])[:2])) if x)
+
+
+def services(info, region):
+    return ((info or {}).get("providers") or {}).get(region, {}).get("stream", [])
+
+
+def stream_text(info, region) -> str:
+    p = ((info or {}).get("providers") or {}).get(region)
+    if not p:
+        return ""
+    if p["stream"]:
+        more = f" +{len(p['stream']) - 2}" if len(p["stream"]) > 2 else ""
+        return "Stream on " + ", ".join(p["stream"][:2]) + more
+    return "Rent or buy" if p["rent"] else ""
+
+
+def info_lines_html(info, region) -> str:
+    d, s = details_text(info), stream_text(info, region)
+    return (f'<div class="tk-meta">{esc(d)}</div>' if d else "") + (f'<div class="tk-stream">{esc(s)}</div>' if s else "")
+
+
+def attribution():
+    if tmdb_on():
+        md('<div class="credits">Film details from <a href="https://www.themoviedb.org" target="_blank">TMDB</a>. '
+           'Streaming info from <a href="https://www.justwatch.com" target="_blank">JustWatch</a>. '
+           'Not endorsed or certified by TMDB.</div>')
+
+
+# ---------- Share images: a picture of the result to send to friends ----------
+
+SHARE_FONTS = Path(__file__).parent / "static" / "share"
+
+
+@functools.lru_cache(maxsize=64)
+def _font(name, size):
+    return ImageFont.truetype(str(SHARE_FONTS / f"{name}.ttf"), size)
+
+
+def _hex(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _spaced(draw, xy_center, text, font, fill, spacing):
+    """Draw letter-spaced text centred on x."""
+    widths = [draw.textlength(ch, font=font) for ch in text]
+    total = sum(widths) + spacing * (len(text) - 1)
+    x = xy_center[0] - total / 2
+    for ch, w in zip(text, widths):
+        draw.text((x, xy_center[1]), ch, font=font, fill=fill)
+        x += w + spacing
+
+
+def _wrap(draw, text, font, max_w, max_lines):
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        test = f"{cur} {w}".strip()
+        if draw.textlength(test, font=font) <= max_w or not cur:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        while draw.textlength(lines[-1] + "…", font=font) > max_w and " " in lines[-1]:
+            lines[-1] = lines[-1].rsplit(" ", 1)[0]
+        lines[-1] += "…"
+    return lines
+
+
+def _poster_image(k, name, w, h):
+    """The same screen-print poster as in the app, drawn with Pillow."""
+    hh = zlib.crc32(str(k).encode())
+    top, bottom, c, ink = (_hex(x) for x in PALETTES[hh % len(PALETTES)])
+    motif = (hh // 13) % len(MOTIFS)
+    img = Image.new("RGB", (w, h))
+    d = ImageDraw.Draw(img)
+    for y in range(h):  # vertical gradient
+        t = y / h
+        d.line([(0, y), (w, y)], fill=tuple(int(a + (b - a) * t) for a, b in zip(top, bottom)))
+    cx, r = w / 2, w * 0.27
+    if motif == 0:
+        d.ellipse([cx - r, h * .64 - r, cx + r, h * .64 + r], fill=c)
+    elif motif == 1:
+        d.ellipse([cx - r * 1.1, h * .70 - r * 1.1, cx + r * 1.1, h * .70 + r * 1.1], fill=c)
+        shade = Image.new("RGBA", (w, int(h * .30)), (0, 0, 0, 50))
+        img.paste(shade, (0, int(h * .70)), shade)
+    elif motif == 2:
+        for a, b in ((.54, .60), (.66, .72), (.78, .84)):
+            d.rectangle([0, h * a, w, h * b], fill=c)
+    elif motif == 3:
+        d.polygon([(w, h * .30), (w, h), (0, h), (0, h * .92)], fill=c)
+    elif motif == 4:
+        for i, rr in enumerate((.04, .12, .20, .28)):
+            R = w * rr * 1.25
+            d.ellipse([cx - R, h * .66 - R, cx + R, h * .66 + R], outline=c, width=max(3, int(w * .035)))
+        d.ellipse([cx - w * .05, h * .66 - w * .05, cx + w * .05, h * .66 + w * .05], fill=c)
+    elif motif == 5:
+        d.ellipse([w * .04, h * .64, w * .96, h * 1.36], fill=c)
+    elif motif == 6:
+        cone = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(cone).polygon([(cx, 0), (w * .05, h), (w * .62, h)], fill=c + (110,))
+        img.paste(cone, (0, 0), cone)
+    elif motif == 7:
+        two = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        dd = ImageDraw.Draw(two)
+        dd.ellipse([w * .37 - r * .95, h * .64 - r * .95, w * .37 + r * .95, h * .64 + r * .95], fill=c + (210,))
+        dd.ellipse([w * .63 - r * .95, h * .64 - r * .95, w * .63 + r * .95, h * .64 + r * .95], fill=c + (130,))
+        img.paste(two, (0, 0), two)
+    else:
+        d.rectangle([w * .30, h * .40, w * .36, h * .86], fill=c)
+        d.rectangle([w * .64, h * .40, w * .70, h * .86], fill=c)
+    f = _font("fraunces-600", int(w * .11))
+    y = int(h * .07)
+    for line in _wrap(d, name, f, w * .82, 4):
+        d.text((w * .09, y), line, font=f, fill=ink)
+        y += int(w * .125)
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=int(w * .04), fill=255)
+    out = Image.new("RGBA", (w, h))
+    out.paste(img, (0, 0), mask)
+    return out
+
+
+def _share_canvas(kicker):
+    W, H = 1080, 1350
+    img = Image.new("RGB", (W, H), _hex("#111926"))
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([W * .05, -H * .35, W * .95, H * .35], fill=(242, 193, 78, 70))
+    glow = glow.filter(ImageFilter.GaussianBlur(140))
+    img.paste(glow, (0, 0), glow)
+    d = ImageDraw.Draw(img)
+    # marquee bulbs around the edge
+    m, step = 34, 30
+    for x in range(m, W - m + 1, step):
+        for y in (m, H - m):
+            d.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(255, 236, 180))
+    for y in range(m + step, H - m, step):
+        for x in (m, W - m):
+            d.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(255, 236, 180))
+    d.rounded_rectangle([m + 22, m + 22, W - m - 22, H - m - 22], radius=26, outline=(242, 193, 78), width=2)
+    _spaced(d, (W / 2, 104), kicker.upper(), _font("bebas-neue", 46), _hex(GOLD), 10)
+    _spaced(d, (W / 2, H - 132), "DOUBLE FEATURE", _font("bebas-neue", 34), _hex(CREAM), 8)
+    f = _font("dm-sans-500", 24)
+    url = "double-feature.streamlit.app"
+    d.text((W / 2 - d.textlength(url, font=f) / 2, H - 88), url, font=f, fill=_hex(MUTED))
+    return img, d
+
+
+@st.cache_data(show_spinner=False, max_entries=200)
+def _fetch_poster(url, w, h):
+    """Download a real poster for a share image, cropped to fill w×h with rounded corners."""
+    if not url.startswith("https://"):
+        return None
+    try:
+        r = requests.get(url, timeout=6)
+        src = Image.open(io.BytesIO(r.content)).convert("RGB")
+    except Exception:
+        return None
+    scale = max(w / src.width, h / src.height)
+    src = src.resize((int(src.width * scale) + 1, int(src.height * scale) + 1), Image.LANCZOS)
+    left, top_ = (src.width - w) // 2, (src.height - h) // 2
+    src = src.crop((left, top_, left + w, top_ + h))
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=int(w * .04), fill=255)
+    out = Image.new("RGBA", (w, h))
+    out.paste(src, (0, 0), mask)
+    return out
+
+
+def share_film_png(kicker, names_line, k, name, year, meta, stream, poster_url=""):
+    img, d = _share_canvas(kicker)
+    W = img.width
+    if names_line:
+        f = _font("fraunces-italic", 48)
+        d.text((W / 2 - d.textlength(names_line, font=f) / 2, 168), names_line, font=f, fill=_hex(CREAM))
+    pw, ph = 440, 660
+    shadow = Image.new("RGBA", (pw + 120, ph + 120), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle([60, 80, pw + 60, ph + 80], radius=24, fill=(0, 0, 0, 170))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(28))
+    img.paste(shadow, (int(W / 2 - pw / 2 - 60), 250 - 60), shadow)
+    poster_ = (_fetch_poster(poster_url, pw, ph) if poster_url else None) or _poster_image(k, name, pw, ph)
+    img.paste(poster_, (int(W / 2 - pw / 2), 250), poster_)
+    y = 950
+    ft = _font("fraunces-600", 66)
+    for line in _wrap(d, name, ft, W - 220, 2):
+        d.text((W / 2 - d.textlength(line, font=ft) / 2, y), line, font=ft, fill=_hex(CREAM))
+        y += 76
+    sub = " · ".join(x for x in (str(year or ""), meta) if x)
+    if sub:
+        _spaced(d, (W / 2, y + 10), sub.upper(), _font("bebas-neue", 36), _hex(MUTED), 4)
+        y += 56
+    if stream:
+        f = _font("dm-sans-500", 30)
+        d.text((W / 2 - d.textlength(stream, font=f) / 2, y + 10), stream, font=f, fill=_hex(GOLD))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=88, optimize=True)
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False, max_entries=100)
+def share_taste_png(score, verdict, a, b, n_both, gap, tougher):
+    img, d = _share_canvas("Taste match")
+    W = img.width
+    f = _font("fraunces-italic", 52)
+    names = f"{a} & {b}"
+    d.text((W / 2 - d.textlength(names, font=f) / 2, 170), names, font=f, fill=_hex(CREAM))
+    cx, cy, R, wd = W / 2, 560, 250, 34
+    box = [cx - R, cy - R, cx + R, cy + R]
+    d.ellipse(box, outline=(43, 52, 68), width=wd)
+    gold, sea = _hex(GOLD), _hex(SEA)
+    end = int(360 * score / 100)
+    for i in range(end):  # gold fading to sea-green, like the ring in the app
+        t = i / max(end, 1)
+        col = tuple(int(g + (s - g) * t) for g, s in zip(gold, sea))
+        d.arc(box, start=-90 + i, end=-90 + i + 1.5, fill=col, width=wd)
+    big = _font("fraunces-600", 190)
+    txt = f"{score}%"
+    d.text((cx - d.textlength(txt, font=big) / 2, cy - 130), txt, font=big, fill=_hex(CREAM))
+    fv = _font("fraunces-italic", 64)
+    d.text((W / 2 - d.textlength(verdict, font=fv) / 2, 860), verdict, font=fv, fill=_hex(GOLD))
+    stats = [(str(n_both), "BOTH RATED"), (f"{gap:.1f}", "AVG STAR GAP"), (tougher, "TOUGHER CRITIC")]
+    for i, (v, lab) in enumerate(stats):
+        x = W / 2 + (i - 1) * 300
+        fv2 = _font("fraunces-600", 58 if len(v) < 9 else 40)
+        d.text((x - d.textlength(v, font=fv2) / 2, 990), v, font=fv2, fill=_hex(CREAM))
+        _spaced(d, (x, 1068), lab, _font("bebas-neue", 28), _hex(MUTED), 3)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=88, optimize=True)
+    return buf.getvalue()
+
+
+SHARE_JS = """
+export default function(component) {
+  const { data, parentElement } = component;
+  let btn = parentElement.querySelector('button.share-btn');
+  if (!btn) { btn = document.createElement('button'); btn.className = 'share-btn'; parentElement.appendChild(btn); }
+  btn.innerHTML = data.label;
+  // Build the file now, so tapping can call the share sheet straight away (phones require that)
+  const bin = atob(data.img);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const file = new File([bytes], data.filename, { type: 'image/jpeg' });
+  btn.onclick = async () => {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file], text: data.text }); return; }
+      catch (e) { if (e && e.name === 'AbortError') return; }
+    }
+    const url = URL.createObjectURL(file);
+    const a = document.createElement('a'); a.href = url; a.download = data.filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+}
+"""
+sharer = st.components.v2.component("share_image", js=SHARE_JS, isolate_styles=False)
+
+ICON_SHARE = ('<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" '
+              'stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 8l5-5 5 5M5 13v6a2 2 0 0 0 2 2h10a2 2 '
+              '0 0 0 2-2v-6"/></svg>')
+
+
+def share_button(img_bytes, filename, text, key, label="Share"):
+    sharer(key=key, data={"img": base64.b64encode(img_bytes).decode(), "filename": filename, "text": text,
+                          "label": f"{ICON_SHARE}<span>{esc(label)}</span>"})
+
+
+DETAILS_CSS = """
+<style>
+.tk-meta { font-size: .8rem; margin-top: .45rem; opacity: .8; }
+.tk-stream { font-size: .8rem; font-weight: 600; margin-top: .2rem; }
+.sw-meta { font-size: .78rem; opacity: .85; margin-top: .15rem; }
+.sw-stream { font-size: .78rem; color: var(--gold); font-weight: 600; margin-top: .1rem; }
+.share-btn { display: flex; align-items: center; justify-content: center; gap: .5rem; width: 100%; min-height: 2.9rem;
+  border-radius: 999px; border: 1.5px solid rgba(242,193,78,.6); background: rgba(242,193,78,.08); color: var(--gold);
+  font-family: var(--label); font-size: 1.15rem; letter-spacing: .14em; padding-top: .15rem; cursor: pointer;
+  -webkit-tap-highlight-color: transparent; }
+.share-btn:active { transform: scale(.98); }
+.credits { color: var(--muted); font-size: .72rem; text-align: center; margin-top: 2.2rem; opacity: .8; }
+.credits a { color: var(--muted) !important; }
+.sw-super { width: 54px; height: 54px; align-self: center; background: rgba(242,193,78,.08); color: var(--gold);
+  box-shadow: inset 0 0 0 2px rgba(242,193,78,.6); }
+.sw-super[disabled] { opacity: .3; cursor: default; }
+.stamp-super { left: 50%; top: 18%; transform: translateX(-50%) rotate(-6deg); color: var(--gold); border-color: var(--gold);
+  white-space: nowrap; font-size: 2rem; }
+.super-tag { color: var(--gold); font-size: .78rem; margin-left: .35rem; }
+</style>
+"""
+md(DETAILS_CSS)
 
 
 # ---------- Swipe night: shared rooms so two phones can swipe on the same deck ----------
@@ -618,13 +1112,15 @@ export default function(component) {
   if (!card) return;
   const key = card.dataset.key;
   const yes = card.querySelector('.stamp-yes'), no = card.querySelector('.stamp-no');
+  const sup = card.querySelector('.stamp-super');
   let sx = 0, sy = 0, dx = 0, dy = 0, dragging = false, done = false;
   const send = (like) => {
     if (done) return; done = true;
     card.style.transition = 'transform .38s ease-in, opacity .38s ease-in';
-    card.style.transform = `translate(${like ? 560 : -560}px, ${dy * 1.5}px) rotate(${like ? 28 : -28}deg)`;
+    card.style.transform = like === 'super' ? 'translate(0, -720px) scale(.9)'
+      : `translate(${like ? 560 : -560}px, ${dy * 1.5}px) rotate(${like ? 28 : -28}deg)`;
     card.style.opacity = '0';
-    (like ? yes : no).style.opacity = 1;
+    (like === 'super' ? sup : like ? yes : no).style.opacity = 1;
     setTimeout(() => setTriggerValue('swipe', { key, like, t: Date.now() }), 230);
   };
   card.addEventListener('pointerdown', (e) => {
@@ -649,6 +1145,8 @@ export default function(component) {
   card.addEventListener('pointercancel', end);
   root.querySelector('.sw-yes').onclick = () => send(true);
   root.querySelector('.sw-no').onclick = () => send(false);
+  const sb = root.querySelector('.sw-super');
+  if (sb && !sb.disabled) sb.onclick = () => send('super');
 }
 """
 swiper = st.components.v2.component("swipe_deck", js=SWIPE_JS, isolate_styles=False)
@@ -664,9 +1162,15 @@ def swipe_card(c, cls: str) -> str:
     art = poster_html(c["key"], c["name"], "", None, "xl", link=False)
     uri = c.get("uri")
     lb = (f'<a class="sw-lb" href="{esc(str(uri))}" target="_blank">Letterboxd ↗</a>' if uri else "")
+    meta = f'<div class="sw-meta">{esc(c["meta"])}</div>' if c.get("meta") else ""
+    if real_poster_url(c["key"], "xl"):  # real posters: put the title in the caption too
+        meta = f'<div class="sw-title">{esc(c["name"])}</div>' + meta
+    strm = f'<div class="sw-stream">{esc(c["stream"])}</div>' if c.get("stream") else ""
     return (f'<div class="sw-card {cls}" data-key="{esc(c["key"])}">{art}'
             f'<div class="stamp stamp-yes">Watch</div><div class="stamp stamp-no">Pass</div>'
-            f'<div class="sw-info"><div><b>{esc(str(c["year"] or ""))}</b> · {esc(c["why"])}</div>{lb}</div></div>')
+            f'<div class="stamp stamp-super">Must watch</div>'
+            f'<div class="sw-info"><div><div><b>{esc(str(c["year"] or ""))}</b> · {esc(c["why"])}</div>{meta}{strm}</div>'
+            f'{lb}</div></div>')
 
 
 def on_swipe(code, seat):
@@ -717,6 +1221,7 @@ def swipe_view(code, host=False):
     names = room["names"]
     COLOURS.update({names[0]: GOLD, names[1]: SEA})
     seat = st.session_state.get(f"seat_{code}")
+    prefetch_posters([(c["key"], c["name"], c["year"]) for c in room["deck"]])
 
     if host and len(room["joined"]) < 2:
         link = f"{st.context.url.split('?')[0]}?room={code}" if st.context.url else ""
@@ -745,7 +1250,13 @@ def swipe_view(code, host=False):
         md(f'<div class="its-match"><div class="im-k">✦ It\'s a match ✦</div>'
            f'<div class="im-t">{esc(names[0])} <em>&amp;</em> {esc(names[1])}</div>'
            f'<div class="im-n">You both swiped right. Tonight\'s film is…</div></div>')
-        md(ticket(c["key"], c["name"], c["year"], c["uri"], esc(c["why"]), kicker="Matched for tonight"))
+        why = esc(c["why"]) + "".join(f'<div class="{cls}">{esc(c[f])}</div>'
+                                      for f, cls in (("meta", "tk-meta"), ("stream", "tk-stream")) if c.get(f))
+        md(ticket(c["key"], c["name"], c["year"], c["uri"], why, kicker="Matched for tonight"))
+        share_button(share_film_png("It's a match", f"{names[0]} & {names[1]}", c["key"], c["name"], c["year"],
+                                    c.get("meta", ""), c.get("stream", ""), real_poster_url(c["key"], "xl")),
+                     "double-feature-match.jpg", f"It's a match: {c['name']} 🎬", key=f"share_match_{code}",
+                     label="Share the match")
         st.button("Keep swiping for another", width="stretch", on_click=keep_swiping, args=(code,))
         return
 
@@ -1040,16 +1551,90 @@ NAME_HELP = "Leave blank to use the name on your Letterboxd profile."
 NAME_HINT = "Optional"
 
 
+EXPORT_URL = "https://letterboxd.com/settings/data/"
+
+
+def export_guide(group=False, expanded=False):
+    """A one-tap link to Letterboxd's export page plus illustrated steps (drawn, so they never go stale)."""
+    with st.expander("How do I get my Letterboxd export?", expanded=expanded):
+        st.link_button("Open Letterboxd's export page", EXPORT_URL, icon=":material/open_in_new:", width="stretch")
+        steps = []
+        if group:
+            steps.append((
+                '<div class="gm-top">New list</div><div class="gm-in">Tonight\'s picks</div>'
+                '<div class="gm-row"></div><div class="gm-row s"></div><div class="gm-row"></div>'
+                '<div class="gm-save">Save</div>',
+                "<b>Make a list first.</b> On Letterboxd, make a list of the 5–10 films you'd happily watch "
+                "tonight. Do this <i>before</i> exporting, or it won't be in the export."))
+        steps += [
+            ('<div class="gm-url"><span>🔒</span>letterboxd.com/settings/data</div>'
+             '<div class="gm-in">Username</div><div class="gm-in">Password</div><div class="gm-save">Sign in</div>',
+             "<b>Open the export page</b> with the button above. It opens in your browser (the Letterboxd phone "
+             "app can't export). Sign in if it asks."),
+            ('<div class="gm-top">Settings</div><div class="gm-tabs"><span>Profile</span><span>Auth</span>'
+             '<span class="on">Data</span></div><div class="gm-btn"><i></i>Export your data</div>',
+             "<b>Tap Export your data</b> on the Data tab, then confirm. Letterboxd builds your file in a few "
+             "seconds."),
+            ('<div class="gm-file"><span class="gm-zip">ZIP</span><div><b>letterboxd-you.zip</b>'
+             '<small>Downloaded</small></div></div><div class="gm-arrow">↓ upload it below</div>',
+             "<b>Come back here and upload the .zip.</b> On iPhone it's in Files → Downloads, on Android in "
+             "Downloads. If it unzipped itself, upload the CSV files inside instead."),
+        ]
+        md('<div class="guide">' + "".join(
+            f'<div class="gstep"><div class="gmock">{mock}</div><div class="gtext"><em>{i}</em>{text}</div></div>'
+            for i, (mock, text) in enumerate(steps, 1)) + "</div>")
+
+
+GUIDE_CSS = """
+<style>
+.guide { display: grid; gap: 10px; margin-top: .7rem; }
+.gstep { display: grid; grid-template-columns: 118px 1fr; gap: .8rem; align-items: center; padding: .65rem;
+  border-radius: 14px; background: rgba(17,25,38,.6); box-shadow: inset 0 0 0 1px var(--line); }
+.gtext { font-size: .86rem; line-height: 1.45; color: var(--muted); }
+.gtext b { color: var(--cream); font-weight: 600; }
+.gtext em { display: inline-grid; place-items: center; width: 1.35rem; height: 1.35rem; border-radius: 50%; font-style: normal;
+  background: rgba(242,193,78,.15); color: var(--gold); font-family: var(--label); font-size: .9rem; margin-right: .4rem;
+  padding-top: .1rem; vertical-align: .05rem; }
+.gmock { border-radius: 12px; background: #e9e6df; padding: .45rem .45rem .5rem; color: #2a2f38; font-size: .56rem;
+  line-height: 1.2; box-shadow: 0 0 0 3px #2a3448, 0 8px 18px -8px rgba(0,0,0,.8); min-height: 92px;
+  display: flex; flex-direction: column; gap: .28rem; overflow: hidden; }
+.gm-url { display: flex; gap: .2rem; align-items: center; background: #fff; border-radius: 6px; padding: .2rem .3rem;
+  font-size: .5rem; color: #555; white-space: nowrap; overflow: hidden; }
+.gm-top { font-weight: 700; font-size: .66rem; }
+.gm-in { background: #fff; border-radius: 4px; padding: .2rem .3rem; color: #999; border: 1px solid #d5d1c8; }
+.gm-row { height: .5rem; border-radius: 3px; background: #c9c3b6; width: 85%; }
+.gm-row.s { width: 60%; }
+.gm-save { align-self: flex-start; background: #2a3448; color: #fff; border-radius: 4px; padding: .18rem .45rem;
+  font-weight: 700; }
+.gm-tabs { display: flex; gap: .35rem; border-bottom: 1px solid #cfc9bd; padding-bottom: .2rem; color: #888; }
+.gm-tabs .on { color: #2a2f38; font-weight: 700; box-shadow: 0 .25rem 0 -.08rem var(--gold-deep); }
+.gm-btn { position: relative; align-self: center; margin-top: .35rem; background: #2a3448; color: #fff; border-radius: 6px;
+  padding: .35rem .5rem; font-weight: 700; white-space: nowrap; }
+.gm-btn i { position: absolute; right: -.35rem; bottom: -.4rem; width: 1rem; height: 1rem; border-radius: 50%;
+  background: rgba(242,193,78,.55); box-shadow: 0 0 0 0 rgba(242,193,78,.7); animation: tapping 1.6s infinite; }
+@keyframes tapping { 70% { box-shadow: 0 0 0 .55rem rgba(242,193,78,0); } 100% { box-shadow: 0 0 0 0 rgba(242,193,78,0); } }
+.gm-file { display: flex; gap: .35rem; align-items: center; background: #fff; border-radius: 8px; padding: .35rem;
+  margin-top: .3rem; }
+.gm-file b { display: block; font-size: .55rem; } .gm-file small { color: #3a8a5a; font-weight: 600; }
+.gm-zip { background: var(--gold); color: #2a2f38; border-radius: 4px; padding: .3rem .25rem; font-weight: 800; font-size: .5rem; }
+.gm-arrow { text-align: center; color: #b07a12; font-weight: 700; margin-top: .15rem; }
+@media (prefers-reduced-motion: reduce) { .gm-btn i { animation: none; } }
+</style>
+"""
+md(GUIDE_CSS)
+
+
 def how_it_works(pairing=True, group=False):
     with st.expander("How it works"):
         steps = [
             "The host starts a movie night and shares the code or link.",
             "Everyone joins on their own phone and brings 5–10 films: make a Letterboxd list, then upload your "
             "Letterboxd export (Settings → Data → Export your data) and pick that list.",
-            "Everyone swipes. The film most people want wins, and you get a shortlist of the top five.",
+            "Everyone swipes, with one super-like each that counts double. The film most people want wins, "
+            "and you get a shortlist of the top five.",
         ] if group else [
-            "Export your data on letterboxd.com: Settings → Data → Export your data. "
-            "It's not available in the phone app.",
+            "Export your Letterboxd data on the website (not the phone app). "
+            "\"How do I get my Letterboxd export?\" below walks you through it.",
             ("One of you uploads theirs and gets a pair code. The other enters the code (or opens the link) "
              "and uploads theirs." if pairing else "Upload both exports here."),
             "Then pick a film at random, swipe to match, see your taste match, and find films to show each other.",
@@ -1203,6 +1788,7 @@ def start_group_vote(code, keys=None):
         random.Random(f"{code}{room['round']}").shuffle(deck)
         room["deck"], room["phase"] = deck, "voting"
         room["votes"] = {m: {} for m in room["members"]}
+        room["supers"] = {}  # one super-like per person per round
         room["round"] += 1
 
 
@@ -1229,21 +1815,31 @@ def group_vote(code, mid):
         room = get_room(code)
         if not room or room["phase"] != "voting" or v["key"] not in room["deck"]:
             return
-        room["votes"].setdefault(mid, {})[v["key"]] = bool(v.get("like"))
+        like = v.get("like")
+        if like == "super":
+            supers = room.setdefault("supers", {})
+            if mid in supers:  # already used this round: count it as a normal yes
+                like = True
+            else:
+                supers[mid] = v["key"]
+        room["votes"].setdefault(mid, {})[v["key"]] = like if like == "super" else bool(like)
         voters = [m for m in room["votes"] if m in room["members"]]
         if voters and all(len(room["votes"][m]) >= len(room["deck"]) for m in voters):
             room["phase"] = "results"
 
 
 def tally(room):
-    """Rank films by yes votes, then fewest no votes. Returns [(key, yes, no)]."""
+    """Rank films by points (a yes is 1, a super-like is 2), then fewest no votes.
+    Returns [(key, yes, no, supers, points)]."""
     rows = []
     for k in room["deck"]:
-        yes = sum(1 for v in room["votes"].values() if v.get(k) is True)
-        no = sum(1 for v in room["votes"].values() if v.get(k) is False)
-        rows.append((k, yes, no))
+        vals = [v.get(k) for v in room["votes"].values()]
+        yes = sum(1 for x in vals if x is True or x == "super")
+        sup = sum(1 for x in vals if x == "super")
+        no = sum(1 for x in vals if x is False)
+        rows.append((k, yes, no, sup, yes + sup))
     tie = random.Random(f"{room['code']}{room['round']}")
-    rows.sort(key=lambda r: (-r[1], r[2], tie.random()))
+    rows.sort(key=lambda r: (-r[4], r[2], tie.random()))
     return rows
 
 
@@ -1317,15 +1913,27 @@ def group_pulse(code, mid, seen):
         md(f'<div class="sw-status"><span class="live"></span><b>{done} of {len(members)}</b> finished voting</div>')
 
 
-def group_deck_html(room, todo):
+ICON_STAR = ('<svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 2.8l2.8 5.9 6.4.8-4.7 '
+             '4.4 1.2 6.4L12 17.2l-5.7 3.1 1.2-6.4-4.7-4.4 6.4-.8z"/></svg>')
+
+
+def group_deck_html(room, todo, infos=None, region="GB", super_used=False):
+    infos = infos or {}
+
     def card(k, cls):
         e = room["films"].get(k) or {"key": k, "name": k.split("|")[0], "year": "", "uri": "", "by": []}
-        return swipe_card({**e, "why": by_names(room, e)}, cls)
+        i = infos.get(k)
+        return swipe_card({**e, "why": by_names(room, e), "meta": details_text(i), "stream": stream_text(i, region)},
+                          cls)
     cards = card(todo[0], "top") + (card(todo[1], "next") if len(todo) > 1 else "")
+    dis = " disabled" if super_used else ""
+    hint = ("Super-like used. Right to watch, left to pass" if super_used
+            else "Right to watch, left to pass. ★ is your one super-like (counts double)")
     return (f'<div class="sw-stack">{cards}</div><div class="sw-btns">'
             f'<button class="sw-btn sw-no" aria-label="Pass">{ICON_X}</button>'
+            f'<button class="sw-btn sw-super" aria-label="Super-like"{dis}>{ICON_STAR}</button>'
             f'<button class="sw-btn sw-yes" aria-label="Watch">{ICON_HEART}</button></div>'
-            f'<div class="sw-hint">Swipe right if you\'d watch it tonight, left to pass</div>')
+            f'<div class="sw-hint">{hint}</div>')
 
 
 def group_film_picker(code, mid, room):
@@ -1341,6 +1949,7 @@ def group_film_picker(code, mid, room):
     else:
         section("Add your films", kicker="Your picks", first=True,
                 note="Upload your Letterboxd export and pick the list you made for tonight.")
+        export_guide(group=True)
         group_film_form(code, mid)
 
 
@@ -1381,6 +1990,8 @@ def group_view(code, mid):
     host = room["members"][room["host"]]["name"]
     with header:
         marquee("Movie night", f"{esc(host)}'s <em>place</em>", f"Group night<i>✦</i>Room <b>{code}</b>")
+        settings_menu()
+    prefetch_posters([(k, f["name"], f["year"]) for k, f in room["films"].items()])
     seen = group_state(room)
 
     if room["phase"] == "lobby":
@@ -1399,7 +2010,11 @@ def group_view(code, mid):
             md(f'<div class="sw-head"><span>Voting as <b>{esc(me_["name"])}</b></span>'
                f'<span>{n - len(todo) + 1} / {n}</span></div>'
                f'<div class="sw-prog"><i style="width:{100 * (n - len(todo)) / max(n, 1):.1f}%"></i></div>')
-            swiper(key=f"gdeck_{code}", data={"html": group_deck_html(room, todo)},
+            region = current_region()
+            infos = film_infos([(k, room["films"][k]["name"], room["films"][k]["year"])
+                                for k in room["deck"] if k in room["films"]])
+            used = mid in room.get("supers", {})
+            swiper(key=f"gdeck_{code}", data={"html": group_deck_html(room, todo, infos, region, used)},
                    on_swipe_change=lambda: group_vote(code, mid))
         else:
             note("<b>Your votes are in.</b> Results appear here as soon as everyone's finished.")
@@ -1411,41 +2026,51 @@ def group_view(code, mid):
         group_pulse(code, mid, seen)
         rows = tally(room)
         voters = sum(1 for v in room["votes"].values() if v)
-        top_yes = rows[0][1] if rows else 0
-        tied = [k for k, y, _ in rows if y == top_yes] if top_yes else []
+        top_pts = rows[0][4] if rows else 0
+        tied = [r[0] for r in rows if r[4] == top_pts] if top_pts else []
         win = room["films"].get(rows[0][0]) if rows else None
         if win and len(tied) == 1:
+            _, w_yes, _, w_sup, _ = rows[0]
+            sup_txt = f' · ★ {w_sup} super-like{"s" if w_sup != 1 else ""}' if w_sup else ""
             md(f'<div class="its-match"><div class="im-k">✦ The votes are in ✦</div>'
                f'<div class="im-t">Tonight\'s <em>pick</em></div>'
-               f'<div class="im-n">{top_yes} of {voters} want to watch it</div></div>')
-            md(ticket(win["key"], win["name"], win["year"], win["uri"], esc(by_names(room, win)),
-                      kicker="Group favourite"))
+               f'<div class="im-n">{w_yes} of {voters} want to watch it{sup_txt}</div></div>')
+            region = current_region()
+            wi = film_infos([(win["key"], win["name"], win["year"])]).get(win["key"])
+            md(ticket(win["key"], win["name"], win["year"], win["uri"],
+                      esc(by_names(room, win)) + info_lines_html(wi, region), kicker="Group favourite"))
+            share_button(share_film_png("Group favourite", f"{host}'s movie night", win["key"], win["name"],
+                                        win["year"], details_text(wi), stream_text(wi, region),
+                                        real_poster_url(win["key"], "xl")),
+                         "double-feature-movie-night.jpg", f"Tonight's movie night pick: {win['name']} 🍿",
+                         key=f"share_group_{code}", label="Share the winner")
         elif tied:
             md(f'<div class="its-match"><div class="im-k">✦ The votes are in ✦</div>'
                f'<div class="im-t">It\'s a <em>tie</em></div>'
-               f'<div class="im-n">{len(tied)} films got {top_yes} yes vote{"s" if top_yes != 1 else ""} each</div></div>')
+               f'<div class="im-n">{len(tied)} films are level at the top</div></div>')
         elif not voters:
             note("<b>Voting closed before anyone voted.</b>")
         else:
             note("<b>Nobody said yes to anything.</b> Maybe add some different films and try again.")
 
         shortlist = [r for r in rows if r[1]][:5]
-        if shortlist and top_yes:
+        if shortlist and top_pts:
             section("The shortlist", kicker="Top films")
             bars = []
-            for i, (k, y, n_) in enumerate(shortlist, 1):
+            for i, (k, y, n_, sup, _) in enumerate(shortlist, 1):
                 e = room["films"][k]
+                star = f'<span class="super-tag">★ {sup}</span>' if sup else ""
                 pct = 100 * y / max(voters, 1)
                 bars.append(f'<div class="row">{poster_html(k, e["name"], e["year"], e["uri"], "sm")}'
                             f'<div class="row-body"><div class="row-t"><a href="{esc(e["uri"])}" target="_blank">'
-                            f'{esc(e["name"])}</a><span class="row-y">{esc(e["year"])}</span></div>'
+                            f'{esc(e["name"])}</a><span class="row-y">{esc(e["year"])}</span>{star}</div>'
                             f'<div class="gbar"><i style="width:{pct:.0f}%"></i></div>'
                             f'<div class="row-s">{esc(by_names(room, e))}</div></div>'
                             f'<div class="row-m"><div class="vs-gap" style="color:var(--gold)">{y}'
                             f'<small>of {voters}</small></div></div></div>')
             md("".join(bars))
         if is_host:
-            runoff = tied if len(tied) > 1 else [k for k, y, _ in rows[:3] if y]
+            runoff = tied if len(tied) > 1 else [r[0] for r in rows[:3] if r[1]]
             if len(runoff) > 1:
                 st.button(f"Run-off: vote again on these {len(runoff)}", type="primary", width="stretch",
                           on_click=start_group_vote, args=(code, runoff))
@@ -1454,6 +2079,7 @@ def group_view(code, mid):
             st.caption(f"{host} can start a run-off or go back to add more films.")
 
     st.button("Leave movie night", on_click=leave_group, key="g_leave")
+    attribution()
 
 
 def group_join_screen(code):
@@ -1557,7 +2183,7 @@ if not paired and st.session_state.get("pair_join"):
         st.button("Back", on_click=unpair)
     elif room["slots"][1] is None:
         note(f"<b>{esc(room['slots'][0]['name'])} wants to pair up.</b> Add your Letterboxd export to join.")
-        how_it_works()
+        export_guide()
         st.text_input("Your name", key="pj_name", placeholder=NAME_HINT, help=NAME_HELP)
         st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="pj_file",
                          help=UPLOAD_HELP)
@@ -1583,6 +2209,7 @@ if not paired and not have_both and st.session_state.get("room"):
                     f"Room <b>{room['code']}</b><i>✦</i><b>{len(room['deck'])}</b> films in the deck")
         else:
             marquee("Swipe night", "Double <em>Feature</em>", "Two phones<i>✦</i>One film")
+        settings_menu()
     swipe_view(st.session_state.room)
     if room:
         st.button("Leave this session", on_click=leave_room)
@@ -1615,6 +2242,7 @@ else:
         st.stop()
 
     if mode == "own":
+        export_guide()
         st.text_input("Your name", key="sp_name", placeholder=NAME_HINT, help=NAME_HELP)
         st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="sp_file",
                          help=UPLOAD_HELP)
@@ -1625,6 +2253,8 @@ else:
         join_box()
         st.stop()
 
+    if not have_both:
+        export_guide()
     with st.expander("Your Letterboxd exports", expanded=not have_both):
         name_a = st.text_input("First person's name", placeholder=NAME_HINT, help=NAME_HELP)
         file_a = st.file_uploader("First person's export", type=["zip", "csv"],
@@ -1674,6 +2304,7 @@ both_seen = pa["seen"] & pb["seen"]
 with header:
     marquee("Now showing", f"{esc(A)} <em>&amp;</em> {esc(B)}",
             f"<b>{len(both_seen)}</b> seen together<i>✦</i><b>{len(shared_wl)}</b> on both watchlists")
+    settings_menu()
 
 t_pick, t_swipe, t_taste, t_swap, t_stats = st.tabs(["Pick", "Swipe", "Taste", "Swaps", "Stats"])
 
@@ -1715,6 +2346,40 @@ with t_pick:
         pool = {k: why for k, why in pool.items()
                 if pd.notna(cat.at[k, "Year"]) and int(cat.at[k, "Year"]) // 10 * 10 in chosen}
 
+    # Film details: length, genre and where it's streaming (only when a TMDB key is set up)
+    region, infos = current_region(), {}
+    if tmdb_on() and pool:
+        with st.spinner("Fetching film details…"):
+            infos = film_infos([(k, str(cat.at[k, "Name"]), cat.at[k, "Year"]) for k in pool])
+        remember_posters(infos)
+        lengths = {"any": "Any length", "90": "Under 1½h", "120": "Under 2h", "150": "Under 2½h"}
+        max_len = filters.segmented_control("Length", list(lengths), default="any", key="f_len",
+                                            format_func=lengths.get) or "any"
+        genres = sorted({g for i in infos.values() for g in i.get("genres", [])})
+        want_g = filters.pills("Genre", genres, selection_mode="multi", key="f_genre") if genres else []
+        svcs = sorted({x for i in infos.values() for x in services(i, region)})
+        want_s = filters.pills("Streaming on", svcs, selection_mode="multi", key="f_svc") if svcs else []
+
+        def keep(k):
+            i = infos.get(k) or {}
+            if max_len != "any" and i.get("runtime") and i["runtime"] > int(max_len):
+                return False
+            if want_g and not set(want_g) & set(i.get("genres", [])):
+                return False
+            return not want_s or bool(set(want_s) & set(services(i, region)))
+
+        pool = {k: why for k, why in pool.items() if keep(k)}
+
+    def pool_cap(k):
+        bits = [reason_text(pool[k])] if pool[k] else []
+        i = infos.get(k)
+        if i:
+            sv = services(i, region)
+            extra = " · ".join(x for x in (fmt_runtime(i.get("runtime")), sv[0] if sv else "") if x)
+            if extra:
+                bits.append(esc(extra))
+        return "<br>".join(bits)
+
     if not pool:
         note("<b>Nothing in the pool.</b> Open Filters to add films one of you loved, or clear the decades.")
     else:
@@ -1723,7 +2388,12 @@ with t_pick:
             r = cat.loc[pick]
             flip = "a" if st.session_state.get("picks", 0) % 2 else "b"
             md(ticket(pick, r["Name"], year_str(r["Year"]), r["Letterboxd URI"],
-                      reason_text(pool[pick], on_ticket=True), flip=flip))
+                      reason_text(pool[pick], on_ticket=True) + info_lines_html(infos.get(pick), region), flip=flip))
+            share_button(share_film_png("Tonight's pick", f"{A} & {B}", pick, str(r["Name"]), year_str(r["Year"]),
+                                        details_text(infos.get(pick)), stream_text(infos.get(pick), region),
+                                        real_poster_url(pick, "xl")),
+                         "double-feature-pick.jpg", f"Tonight's pick: {r['Name']} 🎬", key="share_pick",
+                         label="Share tonight's pick")
         else:
             md(f'<div class="tk-ghost"><b>What are we watching?</b>{len(pool)} films in the hat. '
                f'Let fate decide.</div>')
@@ -1731,8 +2401,7 @@ with t_pick:
                   width="stretch", on_click=pick_film, args=(sorted(pool),))
 
         section("The pool", kicker=f"{len(pool)} films in the hat")
-        poster_wall(sorted(pool, key=lambda k: str(cat.at[k, "Name"]).casefold()), key="all_pool",
-                    cap=lambda k: reason_text(pool[k]) if pool[k] else "")
+        poster_wall(sorted(pool, key=lambda k: str(cat.at[k, "Name"]).casefold()), key="all_pool", cap=pool_cap)
 
 
 # ---------- Swipe ----------
@@ -1746,7 +2415,8 @@ with t_swipe:
     sc = pair["swipe"] if paired else None
     deck = [{"key": k, "name": str(cat.at[k, "Name"]), "year": year_str(cat.at[k, "Year"]),
              "uri": str(cat.at[k, "Letterboxd URI"]) if pd.notna(cat.at[k, "Letterboxd URI"]) else "",
-             "why": reason_plain(why)} for k, why in pool.items()]
+             "why": reason_plain(why), "meta": details_text(infos.get(k)),
+             "stream": stream_text(infos.get(k), region)} for k, why in pool.items()]
     if paired and sc and get_room(sc):
         seat = [A, B][me]
         if st.session_state.get(f"seat_{sc}") != seat:
@@ -1816,6 +2486,9 @@ with t_taste:
            f'<div class="trio"><div><b>{len(common)}</b><span>Both rated</span></div>'
            f'<div><b>{gap.mean():.1f}★</b><span>Average gap</span></div>'
            f'<div><b>{esc(tougher)}</b><span>Tougher critic</span></div></div>')
+        share_button(share_taste_png(score, verdict, A, B, len(common), round(float(gap.mean()), 1), tougher),
+                     "double-feature-taste.jpg", f"Our taste match: {score}% 🎬", key="share_taste",
+                     label="Share our taste match")
 
         section("Side by side", kicker="Every shared rating",
                 note=f'Each dot is a film. <span style="color:{GOLD}">Gold</span>: {esc(A)} rated it higher. '
@@ -1848,9 +2521,12 @@ with t_taste:
             labelColor=MUTED, titleColor=MUTED, gridColor="#ffffff12", domain=False, ticks=False,
             labelFontSize=12, titleFontSize=12, titleFontWeight=500, labelPadding=8, titlePadding=10)
         event = st.altair_chart(chart, theme=None, on_select="rerun", selection_mode="tap", key="taste_scatter")
+        prefetch_posters([(k, str(cat.at[k, "Name"]), cat.at[k, "Year"]) for k in common
+                          if (ra[k] >= 4.5 and rb[k] >= 4.5) or abs(ra[k] - rb[k]) >= 1.5])
         picked = [p.get("k") for p in (event.selection.get("tap") or []) if isinstance(p, dict)] if event else []
         k = picked[0] if picked and picked[0] in ra.index else None
         if k:
+            prefetch_posters([(k, str(cat.at[k, "Name"]), cat.at[k, "Year"])])
             md(f'<div class="row tap-card">{poster(k, "sm")}<div class="row-body"><div class="row-t">{title_link(k)}'
                f'<span class="row-y">{year_str(cat.at[k, "Year"])}</span></div>'
                f'<div class="row-s">{rating_line(A, ra[k])}{rating_line(B, rb[k])}</div></div></div>')
@@ -1896,6 +2572,7 @@ with t_swap:
              f"{stars(threshold)} or higher.")
     else:
         order = sorted(recs.index, key=lambda k: (-recs[k], str(cat.at[k, "Name"]).casefold()))
+        prefetch_posters([(k, str(cat.at[k, "Name"]), cat.at[k, "Year"]) for k in order[:60]])
         md(f'<div class="sec-n" style="margin:.4rem 0 .2rem">{dot(frm)}<b style="color:var(--cream)">'
            f'{len(order)} picks from {esc(frm)}</b> that {esc(to)} hasn\'t seen</div>')
         film_rows(order, key=f"all_recs_{to}", limit=12,
@@ -1975,3 +2652,5 @@ with t_stats:
                 note="Share of each person's ratings at every star level.")
         md(butterfly([(star_bar(lv, CREAM), float(sa.get(lv, 0)), float(sb.get(lv, 0))) for lv in levels],
                      fmt=lambda v: f"{v:.0%}" if v else ""))
+
+attribution()
