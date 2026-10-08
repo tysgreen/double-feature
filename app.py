@@ -640,12 +640,14 @@ def _fetch_info(name, year):
     """Look a film up on TMDB. Returns a dict, {} if not found, or None if TMDB couldn't be reached."""
     if FAKE_TMDB:
         return _fake_info(name, year)
-    res = _tmdb_get("/search/movie", query=name, primary_release_year=year) if year else None
-    if not res or not res.get("results"):
-        res = _tmdb_get("/search/movie", query=name)
-    if res is None:
+    # Search both with and without the year and pool the results. Letterboxd often dates a film by its
+    # festival premiere while TMDB uses the cinema release (or the other way round), so a year-only
+    # search can miss the real film and land on a short with the same name.
+    by_year = _tmdb_get("/search/movie", query=name, year=year) if year else None
+    plain = _tmdb_get("/search/movie", query=name)
+    if by_year is None and plain is None:
         return None
-    hits = res.get("results") or []
+    hits = list({h["id"]: h for r in (plain, by_year) if r for h in (r.get("results") or []) if h.get("id")}.values())
     if not hits:
         return {}
     want = title_key(name)
@@ -654,7 +656,8 @@ def _fetch_info(name, year):
         same = want in (title_key(h.get("title", "")), title_key(h.get("original_title", "")))
         y = (h.get("release_date") or "")[:4]
         off = abs(int(y) - int(year)) if (year and y.isdigit()) else 5
-        return (not same, off, -(h.get("popularity") or 0))
+        # A year either side counts as a match; among those, the film people have actually seen wins.
+        return (not same, off > 1, -(h.get("vote_count") or 0), off, -(h.get("popularity") or 0))
 
     best = sorted(hits, key=rank)[0]
     det = _tmdb_get(f"/movie/{best['id']}") or {}

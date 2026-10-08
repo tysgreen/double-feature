@@ -6,7 +6,7 @@ Double Feature compares two people's Letterboxd data and helps them pick somethi
 
 👉 **[Open the app](https://double-feature.streamlit.app/)**
 
-![Double Feature on a phone: the Pick, Swipe, Taste and Stats tabs](preview.png)
+![Double Feature on a phone: the Pick, Swipe and Taste tabs, plus group night voting and the winning film](preview.png)
 
 ---
 
