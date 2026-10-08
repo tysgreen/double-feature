@@ -1496,6 +1496,9 @@ GROUP_CSS = """
 .tap-card { border-radius: 14px; padding: .65rem .8rem; background: rgba(27,37,54,.8); box-shadow: inset 0 0 0 1px var(--line);
   border-bottom: 0; margin-top: -.3rem; }
 [data-testid="stElementToolbar"] { display: none !important; }  /* chart toolbar covers text on phones */
+/* Touch screens: no hover tooltip (it glitches on tap), the card under the chart does the job instead */
+@media (hover: none) { #vg-tooltip-element { display: none !important; } }
+@media (hover: hover) { .tap-hint { display: none; } }
 .tap-hint { text-align: center; color: var(--muted); font-size: .82rem; margin-top: -.4rem; }
 </style>
 """
