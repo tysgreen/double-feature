@@ -1493,6 +1493,10 @@ GROUP_CSS = """
 .gbar { height: 5px; border-radius: 5px; background: rgba(243,236,221,.08); overflow: hidden; margin-top: .4rem; }
 .gbar i { display: block; height: 100%; background: linear-gradient(90deg, var(--gold), var(--sea)); }
 .reel-item .poster { width: 100%; }
+.tap-card { border-radius: 14px; padding: .65rem .8rem; background: rgba(27,37,54,.8); box-shadow: inset 0 0 0 1px var(--line);
+  border-bottom: 0; margin-top: -.3rem; }
+[data-testid="stElementToolbar"] { display: none !important; }  /* chart toolbar covers text on phones */
+.tap-hint { text-align: center; color: var(--muted); font-size: .82rem; margin-top: -.4rem; }
 </style>
 """
 md(GROUP_CSS)
@@ -1814,26 +1818,41 @@ with t_taste:
                 note=f'Each dot is a film. <span style="color:{GOLD}">Gold</span>: {esc(A)} rated it higher. '
                      f'<span style="color:{SEA}">Green</span>: {esc(B)} did. On the line: you agreed.')
         rng = random.Random(7)
-        plot = pd.DataFrame({"Film": cat.loc[common, "Name"].values, "a": ra.values, "b": rb.values})
+        plot = pd.DataFrame({"k": list(common), "Film": cat.loc[common, "Name"].values,
+                             "a": ra.values, "b": rb.values})
         plot["aj"] = plot["a"] + [rng.uniform(-0.13, 0.13) for _ in range(len(plot))]
         plot["bj"] = plot["b"] + [rng.uniform(-0.13, 0.13) for _ in range(len(plot))]
         plot["Higher"] = ["Agreed" if x == y else (A if x > y else B) for x, y in zip(plot["a"], plot["b"])]
         scale = alt.Scale(domain=[0.25, 5.25], nice=False)
         ax = dict(values=[1, 2, 3, 4, 5], labelExpr="datum.value + '★'")
-        points = alt.Chart(plot).mark_circle(size=110, opacity=0.85, stroke="#111926", strokeWidth=1).encode(
+        # Tapping (or clicking) picks the nearest dot, so it works on phones where there's no hover
+        tap = alt.selection_point(name="tap", fields=["k"], on="click", nearest=True, clear="dblclick")
+        points = alt.Chart(plot).mark_circle(stroke="#111926", strokeWidth=1).encode(
             x=alt.X("aj:Q", title=f"{A} →", scale=scale, axis=alt.Axis(**ax)),
             y=alt.Y("bj:Q", title=f"{B} →", scale=scale, axis=alt.Axis(**ax)),
             color=alt.Color("Higher:N", scale=alt.Scale(domain=[A, B, "Agreed"], range=[GOLD, SEA, CREAM]),
                             legend=None),
+            size=alt.condition(tap, alt.value(260), alt.value(110)),
+            opacity=alt.value(0.85),
+            strokeWidth=alt.condition(tap, alt.value(3), alt.value(1)),
+            stroke=alt.condition(tap, alt.value(CREAM), alt.value("#111926")),
             tooltip=["Film", alt.Tooltip("a:Q", title=A), alt.Tooltip("b:Q", title=B)],
-        )
+        ).add_params(tap)
         diagonal = alt.Chart(pd.DataFrame({"aj": [0.25, 5.25], "bj": [0.25, 5.25]})).mark_line(
             strokeDash=[3, 5], color="#5C6A82", strokeWidth=1.5).encode(x="aj:Q", y="bj:Q")
         chart = (diagonal + points).properties(height=330).configure(
             background="transparent", font="DM Sans").configure_view(stroke=None).configure_axis(
             labelColor=MUTED, titleColor=MUTED, gridColor="#ffffff12", domain=False, ticks=False,
             labelFontSize=12, titleFontSize=12, titleFontWeight=500, labelPadding=8, titlePadding=10)
-        st.altair_chart(chart, theme=None)
+        event = st.altair_chart(chart, theme=None, on_select="rerun", selection_mode="tap", key="taste_scatter")
+        picked = [p.get("k") for p in (event.selection.get("tap") or []) if isinstance(p, dict)] if event else []
+        k = picked[0] if picked and picked[0] in ra.index else None
+        if k:
+            md(f'<div class="row tap-card">{poster(k, "sm")}<div class="row-body"><div class="row-t">{title_link(k)}'
+               f'<span class="row-y">{year_str(cat.at[k, "Year"])}</span></div>'
+               f'<div class="row-s">{rating_line(A, ra[k])}{rating_line(B, rb[k])}</div></div></div>')
+        else:
+            md('<div class="tap-hint">Tap a dot to see which film it is</div>')
 
         loved = sorted((k for k in common if ra[k] >= 4.5 and rb[k] >= 4.5), key=lambda k: -(ra[k] + rb[k]))
         section("You both loved", kicker=f"{len(loved)} mutual favourites" if loved else "Mutual favourites",
