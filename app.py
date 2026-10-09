@@ -24,8 +24,9 @@ import requests
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
-st.set_page_config(page_title="Double Feature", page_icon="🎟️", layout="centered",
-                   initial_sidebar_state="collapsed")
+_FAVICON = Path(__file__).parent / "static" / "favicon.png"
+st.set_page_config(page_title="Double Feature", page_icon=str(_FAVICON) if _FAVICON.exists() else "🎟️",
+                   layout="centered", initial_sidebar_state="collapsed")
 
 EMPTY = pd.DataFrame(columns=["Date", "Name", "Year", "Letterboxd URI"])
 
@@ -169,7 +170,9 @@ a { -webkit-tap-highlight-color: transparent; }
   background: var(--surface) !important; color: var(--text) !important; padding: 0 .85rem; }
 .st-key-settings_wrap button p { font-weight: 700; font-size: .95rem; }
 .marquee { margin: .35rem 0 1.1rem; }
-.mq-brand { font-weight: 800; font-size: 1.15rem; letter-spacing: -.02em; line-height: 2.5rem; }
+.mq-brand { font-weight: 800; font-size: 1.15rem; letter-spacing: -.02em; line-height: 2.5rem;
+  display: flex; align-items: center; gap: .4rem; }
+.mq-brand .logo { display: block; flex: none; }
 .mq-brand span { color: var(--accent-ink); }
 .mq-kick { margin-top: 1rem; font-weight: 700; letter-spacing: .14em; font-size: .78rem; color: var(--muted);
   text-transform: uppercase; }
@@ -255,6 +258,13 @@ input::placeholder, textarea::placeholder { color: var(--muted) !important; -web
 [data-testid="stAlertContainer"] { border: 2px solid var(--line); border-radius: 16px; }
 [data-testid="stToast"] { background: var(--surface) !important; color: var(--text) !important; border: 2px solid var(--line); }
 [data-testid="stCheckbox"] label p, [data-testid="stToggle"] label p { color: var(--text) !important; }
+/* Switches: when off, an outlined white track with a dark knob, so they're easy to see on the pastel backgrounds */
+[data-testid="stCheckbox"] label:has(input[role="switch"]):not([data-selected="true"]) > span + div {
+  background: var(--surface) !important; box-shadow: inset 0 0 0 2px var(--text); }
+[data-testid="stCheckbox"] label:has(input[role="switch"]):not([data-selected="true"]) > span + div > div {
+  background: var(--text) !important; }
+[data-testid="stCheckbox"] label:has(input[role="switch"])[data-selected="true"] > span + div { background: var(--cta-bg) !important; }
+[data-testid="stCheckbox"] label:has(input[role="switch"])[data-selected="true"] > span + div > div { background: var(--surface) !important; }
 [data-testid="stTabPanel"] > div > div:first-child .sec, [data-testid="stTabPanel"] .sec.first { margin-top: .6rem; }
 [data-testid="stSpinner"] * { color: var(--muted) !important; }
 
@@ -463,6 +473,13 @@ export default function(component) {
   if (data && data.save) {
     try { window.localStorage.setItem(KEY, JSON.stringify(data.save)); } catch (e) {}
   }
+  try {  // the icon a phone uses for "Add to Home Screen"
+    if (!document.querySelector('link[rel="apple-touch-icon"]')) {
+      const l = document.createElement('link');
+      l.rel = 'apple-touch-icon'; l.href = new URL('app/static/apple-touch-icon.png', document.baseURI).href;
+      document.head.appendChild(l);
+    }
+  } catch (e) {}
   const seen = (data && data.seen) || {};
   if (!seen.loaded || seen.dark !== dark) setStateValue('env', { dark, saved });
 }
@@ -1272,9 +1289,50 @@ def poster_wall(keys, key: str, cap=None, limit: int = 9):
         show_all_toggle(keys, key)
 
 
+# ---------- Logo: two play buttons, tilted up a little, overlapping in butter ----------
+
+def _round_tri(x, y0, y1, w, r):
+    """An SVG path for a right-pointing triangle with rounded corners."""
+    pts = [(x, y0), (x, y1), (x + w, (y0 + y1) / 2)]
+    corners = []
+    for i, p in enumerate(pts):
+        out = []
+        for q in (pts[i - 1], pts[(i + 1) % 3]):
+            dx, dy = q[0] - p[0], q[1] - p[1]
+            n = math.hypot(dx, dy)
+            out.append((p[0] + dx / n * r, p[1] + dy / n * r))
+        corners.append((out[0], p, out[1]))
+    d = f"M{corners[0][2][0]:.1f} {corners[0][2][1]:.1f}"
+    for i in (1, 2, 0):
+        a_, v, b_ = corners[i]
+        d += f" L{a_[0]:.1f} {a_[1]:.1f} Q{v[0]:.1f} {v[1]:.1f} {b_[0]:.1f} {b_[1]:.1f}"
+    return d + " Z"
+
+
+_LOGO_A = _round_tri(10, 17, 83, 58, 12)
+_LOGO_B = _round_tri(39, 17, 83, 58, 12)
+
+
+def logo_svg(px: int, shadow: bool = True) -> str:
+    """The logo as an <img>, coloured for the current theme (pink = first person, blue = second, butter = both)."""
+    a, b, mid = TOKENS["pa"], TOKENS["pb"], TOKENS["butter"]
+    line = TOKENS["line"]
+
+    def p(d, fill, stroke=""):
+        s = f' stroke="{stroke}" stroke-width="4.5" stroke-linejoin="round"' if stroke else ""
+        return f'<path d="{d}" fill="{fill}"{s}/>'
+
+    sh = (f'<g transform="translate(4.5 4.5)">{p(_LOGO_A, line, line)}{p(_LOGO_B, line, line)}</g>' if shadow else "")
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 9 104 84"><defs><clipPath id="b"><path d="{_LOGO_B}"/>'
+           f'</clipPath></defs><g transform="rotate(-8 56 50)">{sh}{p(_LOGO_A, a)}{p(_LOGO_B, b)}'
+           f'<path d="{_LOGO_A}" fill="{mid}" clip-path="url(#b)"/>{p(_LOGO_A, "none", line)}{p(_LOGO_B, "none", line)}</g></svg>')
+    uri = "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+    return f'<img class="logo" src="{uri}" width="{px}" height="{round(px * 84 / 104)}" alt="">'
+
+
 def marquee(kicker: str, title: str, sub: str = ""):
     """The header on every screen: wordmark, Settings, a small label, a big title and a line under it."""
-    md('<div class="marquee"><div class="mq-brand">double<span>·</span>feature</div>'
+    md(f'<div class="marquee"><div class="mq-brand">{logo_svg(38)}<div>double<span>·</span>feature</div></div>'
        + (f'<div class="mq-kick">{kicker}</div>' if kicker else "")
        + f'<div class="mq-title">{title}</div>'
        + (f'<div class="mq-sub">{sub}</div>' if sub else "") + '</div>')
@@ -1788,6 +1846,16 @@ def _pill(d, cx, y, text, font, fill, pad_x=26, h=62, outline=6):
            fill=_hex(SH["ink"]))
 
 
+@st.cache_resource(show_spinner=False)
+def _share_mark():
+    """The logo for share images (drawn once from static/share/logo-mark.png), or None if the file is missing."""
+    try:
+        im = Image.open(Path(__file__).parent / "static" / "share" / "logo-mark.png").convert("RGBA")
+        return im.resize((72, round(72 * im.height / im.width)), Image.LANCZOS)
+    except OSError:
+        return None
+
+
 def _share_canvas(kicker):
     W, H = 1080, 1350
     img = Image.new("RGB", (W, H), _hex(SH["bg"]))
@@ -1801,7 +1869,13 @@ def _share_canvas(kicker):
     _pill(d, W / 2, 70, kick, f, SH["butter"])
     f = _font("bricolage-800", 44, "double·feature")
     brand = "double·feature"
-    d.text((W / 2 - d.textlength(brand, font=f) / 2, H - 150), brand, font=f, fill=ink)
+    mark = _share_mark()
+    gap = 14 if mark else 0
+    tw = d.textlength(brand, font=f)
+    x0 = W / 2 - (tw + gap + (mark.width if mark else 0)) / 2
+    if mark:
+        img.paste(mark, (int(x0), H - 150 - 4), mark)
+    d.text((x0 + (mark.width if mark else 0) + gap, H - 150), brand, font=f, fill=ink)
     f = _font("bricolage-500", 26)
     url = "double-feature.streamlit.app"
     d.text((W / 2 - d.textlength(url, font=f) / 2, H - 92), url, font=f, fill=_hex(SH["muted"]))

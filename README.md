@@ -1,4 +1,6 @@
-# 🎬 Double Feature
+<img src="static/logo.png" alt="Double Feature" width="420">
+
+# Double Feature
 
 **Two Letterboxd accounts, one movie night.**
 
@@ -113,6 +115,7 @@ It opens in your browser. To try it on a phone on the same Wi-Fi, use the **Netw
 - **Pairing and swiping:** rooms live in server memory (`st.cache_resource`) under a four-letter code. Both phones check for changes every couple of seconds. The swipe cards are a small custom component (`st.components.v2`) that supports dragging and buttons.
 - **Sharing:** uses the phone's own share sheet where it's available, otherwise the image downloads.
 - **Look and colours:** `.streamlit/config.toml` sets the light base theme. The background colours and dark mode are CSS variables the app swaps in per person, and the choice is saved in the phone's browser storage (nothing is sent anywhere).
+- **Logo:** two play buttons overlapping, in the two people's colours (pink and blue) with the overlap in butter. The header draws it as an SVG in the current theme's colours; `static/favicon.png` is the browser-tab icon, `static/apple-touch-icon.png` is the home-screen icon, and `static/share/logo-mark.png` goes on share images.
 - **Fonts:** Bricolage Grotesque (SIL Open Font License, see `static/share/OFL-bricolage.txt`) is served from `static/`, with TTF copies in `static/share/` for drawing share images. The `fallback-*` fonts are trimmed copies of DejaVu Sans and DejaVu Serif, used for names and titles with letters Bricolage doesn't have (Greek, Cyrillic and so on).
 
 ```
@@ -123,10 +126,14 @@ It opens in your browser. To try it on a phone on the same Wi-Fi, use the **Netw
 └── static/
     ├── bricolage.woff2
     ├── bricolage-ext.woff2
+    ├── favicon.png
+    ├── apple-touch-icon.png
+    ├── logo.png
     └── share/
         ├── bricolage-500.ttf
         ├── bricolage-700.ttf
         ├── bricolage-800.ttf
+        ├── logo-mark.png
         ├── OFL-bricolage.txt
         ├── fallback-sans.ttf
         └── fallback-serif.ttf
