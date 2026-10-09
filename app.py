@@ -2,7 +2,7 @@
 
 import base64
 import concurrent.futures
-import functools
+import copy
 import html
 import io
 import math
@@ -10,7 +10,6 @@ import os
 import random
 import re
 import secrets
-import string
 import threading
 import time
 import unicodedata
@@ -23,38 +22,74 @@ import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 st.set_page_config(page_title="Double Feature", page_icon="🎟️", layout="centered",
                    initial_sidebar_state="collapsed")
 
-GOLD = "#F2C14E"
-SEA = "#8EC5C0"
-CREAM = "#F3ECDD"
-MUTED = "#98A2B5"
 EMPTY = pd.DataFrame(columns=["Date", "Name", "Year", "Letterboxd URI"])
 
 
 # ---------- Loading a Letterboxd export ----------
 
+def _csv_name(path: str) -> str:
+    """'Ratings (1).csv' -> 'ratings.csv', so re-downloaded or renamed copies still count."""
+    base = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return re.sub(r"\s*\(\d+\)(?=\.csv$)", "", base)
+
+
 def _find(z: zipfile.ZipFile, filename: str):
-    """Find a CSV in the export, skipping the deleted/orphaned/likes/lists folders."""
-    skip = {"deleted", "orphaned", "likes", "lists"}
+    """Find a CSV in the export, skipping the deleted/orphaned/likes/lists folders and Mac junk."""
+    skip = {"deleted", "orphaned", "likes", "lists", "__macosx"}
     for n in z.namelist():
-        parts = n.split("/")
-        if parts[-1] == filename and not skip.intersection(parts[:-1]):
+        parts = n.lower().replace("\\", "/").split("/")
+        if _csv_name(n) == filename and not skip.intersection(parts[:-1]) and not parts[-1].startswith("._"):
             return n
     return None
+
+
+def _read_csv(data: bytes) -> pd.DataFrame:
+    """Read a CSV as plain text. Copes with a BOM, Excel's semicolons and non-UTF-8 files."""
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            text = data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        first = text.split("\n", 1)[0]
+        seps = [";", ","] if first.count(";") > first.count(",") else [",", ";"]  # Excel in some countries uses ;
+        for sep in seps:
+            try:
+                df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, sep=sep)
+            except pd.errors.EmptyDataError:
+                return pd.DataFrame()
+            except pd.errors.ParserError:
+                continue
+            if df.shape[1] > 1 or sep == seps[-1]:
+                return df
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def safe_uri(u):
+    """Only real web links are kept, so nothing odd from an uploaded file ends up in a link."""
+    u = "" if u is None or (not isinstance(u, str) and pd.isna(u)) else str(u).strip()
+    return u if u.startswith(("https://", "http://")) else None
 
 
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in ("Name", "Year", "Letterboxd URI"):
         if col not in df.columns:
-            df[col] = pd.NA
-    df["Year"] = pd.to_numeric(df["Year"], errors="coerce").astype("Int64")
-    # Match films across accounts on title + year
-    df["key"] = df["Name"].astype(str).str.strip().str.casefold() + "|" + df["Year"].astype(str)
+            df[col] = ""
+    df["Name"] = df["Name"].fillna("").astype(str).str.strip()
+    df = df[df["Name"] != ""].copy()
+    year = pd.to_numeric(df["Year"], errors="coerce")
+    year = year.where((year == year.round()) & year.between(1870, 2100))
+    df["Year"] = year.astype("Int64")
+    df["Letterboxd URI"] = df["Letterboxd URI"].map(safe_uri)
+    # Match films across accounts on title + year ("<NA>" when a film has no year yet)
+    yr = df["Year"].map(lambda y: "<NA>" if pd.isna(y) else str(int(y))).astype(str)
+    df["key"] = df["Name"].str.casefold() + "|" + yr
     return df.drop_duplicates("key", keep="last")
 
 
@@ -66,26 +101,24 @@ def load_export(raw: bytes) -> dict:
     for name in ("watched", "ratings", "watchlist"):
         path = _find(z, f"{name}.csv")
         out["found"] += bool(path)
-        out[name] = _clean(pd.read_csv(z.open(path)) if path else EMPTY)
+        out[name] = _clean(_read_csv(z.read(path)) if path else EMPTY)
     if "Rating" not in out["ratings"].columns:
         out["ratings"]["Rating"] = pd.Series(dtype=float)
     # profile.csv gives a default display name: given name, else Letterboxd username
     out["name"] = ""
     path = _find(z, "profile.csv")
     if path:
-        try:
-            prof = pd.read_csv(z.open(path), dtype=str).fillna("")
-            if len(prof):
-                row = prof.iloc[0]
-                out["name"] = (row.get("Given Name", "") or row.get("Username", "")).strip()
-        except (pd.errors.ParserError, UnicodeDecodeError):
-            pass
+        prof = _read_csv(z.read(path))
+        if len(prof):
+            row = prof.iloc[0]
+            out["name"] = clean_name(row.get("Given Name", "") or row.get("Username", ""))
     return out
 
 
 def summarise(d: dict) -> dict:
     seen = set(d["watched"]["key"]) | set(d["ratings"]["key"])
-    ratings = pd.to_numeric(d["ratings"].set_index("key")["Rating"], errors="coerce").dropna()
+    ratings = pd.to_numeric(d["ratings"].set_index("key")["Rating"].astype(str).str.replace(",", ".", regex=False),
+                            errors="coerce").dropna()
     return {
         "seen": seen,
         "watchlist": set(d["watchlist"]["key"]) - seen,
@@ -107,272 +140,359 @@ def build_catalog(*exports: dict) -> pd.DataFrame:
 
 # ---------- Styling ----------
 
-GRAIN = ("url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'>"
-         "<filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/>"
-         "<feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 .55 0'/></filter>"
-         "<rect width='100%' height='100%' filter='url(%23n)' opacity='.16'/></svg>\")")
-
 CSS = """
 <style>
 :root {
-  --gold: #F2C14E; --gold-deep: #D99A2B; --sea: #8EC5C0; --coral: #EE8A6D;
-  --ink: #111926; --surface: #1B2536; --surface-2: #222E42; --line: rgba(243,236,221,.10);
-  --cream: #F3ECDD; --muted: #98A2B5;
-  --display: "Fraunces", Georgia, serif; --sans: "DM Sans", system-ui, sans-serif;
-  --label: "Bebas Neue", "DM Sans", sans-serif;
+  --sans: "Bricolage Grotesque", system-ui, sans-serif;
+  --display: var(--sans); --label: var(--sans);
   --stars: "DejaVu Sans", "Segoe UI Symbol", "Apple Symbols", sans-serif;
 }
 @property --p { syntax: "<number>"; inherits: true; initial-value: 0; }
 
-/* Page: deep navy, warm projector glow from the top, a little film grain */
-.stApp {
-  background:
-    GRAIN_URL,
-    radial-gradient(110% 55% at 50% -12%, rgba(242,193,78,.20), rgba(242,193,78,0) 62%),
-    radial-gradient(70% 40% at 100% 105%, rgba(142,197,192,.10), rgba(142,197,192,0) 70%),
-    #111926;
-  background-attachment: fixed;
-}
+/* Page: a soft background the person picks in Settings (or After dark) */
+.stApp { background: var(--bg); color: var(--text); font-family: var(--sans); }
 [data-testid="stHeader"] { background: transparent; }
-[data-testid="stMainBlockContainer"], .block-container { max-width: 560px; padding: 1rem 1rem 6rem; }
+/* The top padding leaves room for the hosting toolbar (Streamlit Cloud puts its icons up there) */
+[data-testid="stMainBlockContainer"], .block-container { max-width: 560px; padding: 3.4rem 1rem 6rem; }
+[data-testid="stMarkdownContainer"] { color: var(--text); }
 [data-testid="stMarkdownContainer"] p { margin-bottom: 0; }
 a { -webkit-tap-highlight-color: transparent; }
+.st-key-prefs { display: none !important; }
+/* The CSS blocks render as empty markdown elements; drop them so they don't add gaps above the header */
+[data-testid="stElementContainer"]:has(style) { display: none !important; }
 
-/* ---------- Marquee header ---------- */
-.marquee {
-  position: relative; border-radius: 22px; padding: 11px; margin: .5rem 0 1.1rem;
-  background:
-    radial-gradient(circle, #FFF1C4 0 2.2px, rgba(242,193,78,.55) 3px, rgba(242,193,78,0) 6px) 0 0 / 15px 15px,
-    linear-gradient(180deg, #3A2A12, #241A0C);
-  box-shadow: 0 0 0 1px rgba(242,193,78,.35), 0 18px 50px -18px rgba(242,193,78,.45);
-  animation: chase 1.6s steps(2) infinite;
-}
-@keyframes chase { to { background-position: 7.5px 0, 0 0; } }
-.marquee-in {
-  border-radius: 13px; padding: 1.15rem 1rem 1.05rem; text-align: center;
-  background: linear-gradient(180deg, #1A2232, #121A27);
-  box-shadow: inset 0 0 0 1px rgba(242,193,78,.28), inset 0 10px 30px rgba(0,0,0,.35);
-}
-.mq-kick { font-family: var(--label); letter-spacing: .32em; font-size: .86rem; color: var(--gold);
-  display: flex; align-items: center; justify-content: center; gap: .6rem; }
-.mq-kick:before, .mq-kick:after { content: ""; height: 1px; width: 2.2rem;
-  background: linear-gradient(90deg, rgba(242,193,78,0), rgba(242,193,78,.8)); }
-.mq-kick:after { transform: scaleX(-1); }
-.mq-title { font-family: var(--display); font-weight: 600; font-size: 2.55rem; line-height: 1.02;
-  letter-spacing: -.01em; margin: .35rem 0 .45rem; color: var(--cream);
-  text-shadow: 0 0 24px rgba(242,193,78,.25); font-variation-settings: "SOFT" 60, "WONK" 1; }
-.mq-title em { font-style: italic; color: var(--gold); font-weight: 400; padding: 0 .05em; }
-.mq-sub { font-family: var(--label); letter-spacing: .1em; font-size: .95rem; white-space: nowrap; color: var(--muted); }
-.mq-sub b { color: var(--cream); font-weight: 400; }
-.mq-sub i { font-style: normal; color: rgba(242,193,78,.6); padding: 0 .4rem; }
+/* ---------- Header ---------- */
+.st-key-hdr { position: relative; }
+.st-key-settings_wrap { position: absolute !important; top: .15rem; right: 0; width: auto !important; z-index: 5; }
+.st-key-settings_wrap [data-testid="stPopoverButton"], .st-key-settings_wrap button {
+  min-height: 2.5rem; border-radius: 999px !important; border: 2px solid var(--line) !important;
+  background: var(--surface) !important; color: var(--text) !important; padding: 0 .85rem; }
+.st-key-settings_wrap button p { font-weight: 700; font-size: .95rem; }
+.marquee { margin: .35rem 0 1.1rem; }
+.mq-brand { font-weight: 800; font-size: 1.15rem; letter-spacing: -.02em; line-height: 2.5rem; }
+.mq-brand span { color: var(--accent-ink); }
+.mq-kick { margin-top: 1rem; font-weight: 700; letter-spacing: .14em; font-size: .78rem; color: var(--muted);
+  text-transform: uppercase; }
+.mq-title { font-weight: 800; font-size: 2.75rem; line-height: .95; letter-spacing: -.045em; margin: .3rem 0 .55rem;
+  overflow-wrap: anywhere; }
+.mq-title em { font-style: normal; color: var(--accent-ink); }
+.mq-sub { font-size: .98rem; font-weight: 500; color: var(--muted); }
+.mq-sub b { color: var(--text); font-weight: 800; }
+.mq-sub i { font-style: normal; color: var(--accent-ink); padding: 0 .45rem; }
 
-/* ---------- Tabs as a pill bar ---------- */
+/* ---------- Tabs: a dark pill bar, the open tab in butter ---------- */
 [data-testid="stTabs"] [role="tablist"] {
-  gap: 4px; padding: 5px; border-radius: 999px; background: rgba(27,37,54,.85);
-  box-shadow: inset 0 0 0 1px var(--line); margin-bottom: .6rem; overflow: visible;
+  gap: 2px; padding: 5px; border-radius: 999px; background: var(--nav-bg); border: 2px solid var(--line);
+  margin-bottom: .7rem; overflow: visible;
 }
 [data-testid="stTabs"] [role="tab"] {
-  flex: 1 1 0; justify-content: center; border-radius: 999px; padding: .55rem 0 .42rem; margin: 0;
+  flex: 1 1 0; justify-content: center; border-radius: 999px; padding: .5rem 0 .45rem; margin: 0;
   height: auto; border: 0 !important; background: transparent; transition: background .2s, color .2s;
 }
-[data-testid="stTabs"] [role="tab"] p { font-family: var(--label); font-size: 1.12rem !important;
-  letter-spacing: .12em; color: var(--muted); }
-[data-testid="stTabs"] [role="tab"][aria-selected="true"] {
-  background: linear-gradient(180deg, #F6CF6B, var(--gold)); box-shadow: 0 6px 18px -6px rgba(242,193,78,.6);
-}
-[data-testid="stTabs"] [role="tab"][aria-selected="true"] p { color: var(--ink); }
+[data-testid="stTabs"] [role="tab"] p { font-size: .95rem !important; font-weight: 700; color: var(--nav-fg); }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] { background: var(--butter); }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] p { color: #1F1A17; font-weight: 800; }
+[data-testid="stTabs"] [role="tablist"]::after, [data-testid="stTabs"] [role="tablist"]::before,
 [data-baseweb="tab-highlight"], [data-baseweb="tab-border"], [data-testid="stTabs"] .react-aria-SelectionIndicator { display: none !important; }
 
-/* ---------- Widgets ---------- */
-[data-testid="stExpander"] details { border-radius: 16px; border: 1px solid var(--line);
-  background: rgba(27,37,54,.7); }
-[data-testid="stExpander"] summary p { font-weight: 600; }
+/* ---------- Streamlit widgets, restyled as stickers ---------- */
+[data-testid="stExpander"] details { border-radius: 18px; border: 2px solid var(--line); background: var(--surface);
+  box-shadow: 3px 3px 0 var(--line); }
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary p { color: var(--text); font-weight: 700; }
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary:hover { background: transparent !important; border-radius: 16px; }
+[data-testid="stExpander"] summary svg { color: var(--text); fill: var(--text); }
 [data-testid="stBaseButton-primary"] {
-  min-height: 3.5rem; border: 0;
-  background: linear-gradient(180deg, #F7D06E 0%, var(--gold) 55%, var(--gold-deep) 100%);
-  box-shadow: 0 10px 28px -10px rgba(242,193,78,.7), inset 0 1px 0 rgba(255,255,255,.45);
-}
-[data-testid="stBaseButton-primary"] p { font-family: var(--label); font-size: 1.45rem !important;
-  letter-spacing: .14em; color: var(--ink); padding-top: .15rem; }
-[data-testid="stBaseButton-primary"]:hover { filter: brightness(1.05); }
-[data-testid="stBaseButton-primary"]:disabled { opacity: .4; box-shadow: none; filter: saturate(.6); }
+  min-height: 3.5rem; border: 2px solid var(--line); background: var(--cta-bg); color: var(--cta-fg);
+  box-shadow: none; }
+[data-testid="stBaseButton-primary"] p { font-size: 1.15rem !important; font-weight: 800; color: var(--cta-fg); }
+[data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primary"]:focus-visible {
+  background: var(--cta-bg); border-color: var(--line); color: var(--cta-fg); filter: brightness(1.12); }
+[data-testid="stBaseButton-primary"]:disabled { opacity: 1; background: var(--surface); border: 2px dashed var(--muted);
+  filter: none; cursor: not-allowed; }
+[data-testid="stBaseButton-primary"]:disabled p { color: var(--muted); }
 [data-testid="stBaseButton-primary"]:active { transform: translateY(1px) scale(.995); }
-button[data-variant="pills"], button[data-variant="segmented_control"] { min-height: 2.4rem; }
-button[data-variant="pills"][aria-pressed="true"], button[data-variant="segmented_control"][aria-checked="true"] {
-  background: rgba(242,193,78,.16) !important; border-color: rgba(242,193,78,.7) !important; color: var(--gold) !important; }
+[data-testid="stBaseButton-secondary"], [data-testid="stBaseLinkButton-secondary"], [data-testid="stPopoverButton"] {
+  min-height: 2.9rem; border: 2px solid var(--line); background: var(--surface); color: var(--text); }
+[data-testid="stBaseButton-secondary"] p, [data-testid="stBaseLinkButton-secondary"] p, [data-testid="stPopoverButton"] p {
+  font-weight: 700; color: var(--text); }
+[data-testid="stBaseButton-secondary"]:hover, [data-testid="stBaseLinkButton-secondary"]:hover {
+  border-color: var(--line); color: var(--text); background: var(--surface); filter: brightness(.97); }
+[data-testid="stBaseButton-tertiary"] p { color: var(--text); font-weight: 700; }
+button[data-variant="pills"], button[data-variant="segmented_control"] {
+  min-height: 2.4rem; border: 2px solid var(--line) !important; background: var(--surface) !important;
+  color: var(--text) !important; font-weight: 700; }
+button[data-variant="pills"] p, button[data-variant="segmented_control"] p { color: var(--text) !important; font-weight: 700; }
+button[data-variant="pills"][data-selected="true"], button[data-variant="segmented_control"][data-selected="true"],
+button[data-variant="pills"][aria-checked="true"], button[data-variant="segmented_control"][aria-checked="true"] {
+  background: var(--butter) !important; color: #1F1A17 !important; }
+button[data-variant="pills"][data-selected="true"] p, button[data-variant="segmented_control"][data-selected="true"] p,
+button[data-variant="pills"][aria-checked="true"] p, button[data-variant="segmented_control"][aria-checked="true"] p {
+  color: #1F1A17 !important; font-weight: 800; }
+[data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] label { color: var(--text) !important; font-weight: 700; }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color: var(--muted) !important; }
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="select"] > div, [data-baseweb="textarea"],
+[data-testid="stTextInput"] div:has(> input), [data-testid="stTextArea"] div:has(> textarea),
+[data-testid="stSelectbox"] [role="group"] {
+  background: var(--surface) !important; border-color: var(--line) !important; border-width: 2px !important; }
+[data-baseweb="input"] input, [data-baseweb="textarea"] textarea, [data-baseweb="select"] div,
+[data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea, [data-testid="stSelectbox"] input {
+  background: transparent !important; color: var(--text) !important; -webkit-text-fill-color: var(--text); }
+[data-testid="stSelectbox"] button svg { color: var(--text); fill: var(--text); }
+[role="listbox"], [data-testid="stSelectboxVirtualDropdown"] { background: var(--surface) !important; }
+[role="listbox"] [role="option"], [role="listbox"] [role="option"] * { color: var(--text) !important; }
+input::placeholder, textarea::placeholder { color: var(--muted) !important; -webkit-text-fill-color: var(--muted); opacity: 1; }
+[data-baseweb="select"] svg { color: var(--text); }
+[data-baseweb="popover"] ul, [data-baseweb="popover"] [role="listbox"], [data-baseweb="menu"] { background: var(--surface) !important; }
+[data-baseweb="popover"] li { color: var(--text) !important; }
+[data-testid="stPopoverBody"] { background: var(--bg) !important; border: 2px solid var(--line); border-radius: 18px;
+  box-shadow: 4px 4px 0 var(--line); color: var(--text); }
+[data-testid="stFileUploaderDropzone"] { border: 2.5px dashed var(--line); background: color-mix(in srgb, var(--surface) 60%, transparent);
+  border-radius: 18px; }
+[data-testid="stFileUploaderDropzone"] *, [data-testid="stFileUploaderFile"] * { color: var(--text) !important; }
+[data-testid="stFileUploaderDropzone"] button { border: 2px solid var(--line); background: var(--surface); }
+[data-testid="stCode"] pre, [data-testid="stCode"] code { background: var(--surface) !important; color: var(--text) !important; }
+[data-testid="stCode"] { border: 2px solid var(--line); border-radius: 14px; overflow: hidden; }
+[data-testid="stAlertContainer"] { border: 2px solid var(--line); border-radius: 16px; }
+[data-testid="stToast"] { background: var(--surface) !important; color: var(--text) !important; border: 2px solid var(--line); }
+[data-testid="stCheckbox"] label p, [data-testid="stToggle"] label p { color: var(--text) !important; }
 [data-testid="stTabPanel"] > div > div:first-child .sec, [data-testid="stTabPanel"] .sec.first { margin-top: .6rem; }
-[data-testid="stFileUploaderDropzone"] { border: 1.5px dashed rgba(242,193,78,.35); background: rgba(17,25,38,.6); }
-[data-testid="stCaptionContainer"] { color: var(--muted); }
+[data-testid="stSpinner"] * { color: var(--muted) !important; }
+
+/* Colour swatches on the background picker */
+.st-key-theme_pick button { gap: .35rem; padding: 0 .55rem; }
+.st-key-theme_pick button:before { content: ""; width: .9rem; height: .9rem; flex: none;
+  border-radius: 50%; border: 2px solid var(--text); background: var(--sw); }
+.st-key-theme_pick button:nth-of-type(1) { --sw: #ECE7F7; } .st-key-theme_pick button:nth-of-type(2) { --sw: #FBF1D3; }
+.st-key-theme_pick button:nth-of-type(3) { --sw: #F9E7E8; } .st-key-theme_pick button:nth-of-type(4) { --sw: #DCE3FA; }
+.st-key-theme_pick button:nth-of-type(5) { --sw: #1D1828; }
 
 /* ---------- Section headings ---------- */
 .sec { margin: 1.9rem 0 .8rem; }
-.sec-k { font-family: var(--label); letter-spacing: .22em; font-size: .9rem; color: var(--gold); }
-.sec-t { font-family: var(--display); font-weight: 600; font-size: 1.6rem; line-height: 1.1; margin: .1rem 0 0;
-  font-variation-settings: "SOFT" 50; }
-.sec-n { color: var(--muted); font-size: .9rem; margin-top: .35rem; line-height: 1.45; }
-.note { border-radius: 16px; padding: 1rem 1.1rem; background: rgba(27,37,54,.75);
-  box-shadow: inset 0 0 0 1px var(--line); color: var(--muted); line-height: 1.5; font-size: .95rem; }
-.note b { color: var(--cream); font-weight: 600; }
+.sec-k { font-weight: 700; letter-spacing: .14em; font-size: .78rem; color: var(--muted); text-transform: uppercase; }
+.sec-t { font-weight: 800; font-size: 1.75rem; line-height: 1.02; letter-spacing: -.035em; margin: .2rem 0 0; }
+.sec-n { color: var(--muted); font-size: .95rem; font-weight: 500; margin-top: .4rem; line-height: 1.4; }
+.note { border-radius: 18px; padding: 1rem 1.1rem; background: var(--surface); border: 2px solid var(--line);
+  color: var(--muted); line-height: 1.45; font-size: .97rem; font-weight: 500; }
+.note b { color: var(--text); font-weight: 800; }
 
 /* ---------- Posters ---------- */
 .poster { position: relative; display: flex; flex-direction: column; aspect-ratio: 2 / 3; overflow: hidden;
-  border-radius: 6px; color: var(--pi); text-decoration: none !important; isolation: isolate;
-  box-shadow: 0 1px 0 rgba(255,255,255,.12) inset, 0 10px 22px -12px rgba(0,0,0,.9), 0 0 0 1px rgba(0,0,0,.25); }
+  border-radius: 10px; color: var(--pi); text-decoration: none !important; isolation: isolate;
+  border: 2px solid var(--line); box-shadow: 3px 3px 0 var(--line); box-sizing: border-box; }
 .poster, .poster:link, .poster:visited, .poster:hover { color: var(--pi) !important; }
-.poster:after { content: ""; position: absolute; inset: 0; z-index: -1; background: GRAIN_URL; opacity: .6;
-  mix-blend-mode: overlay; }
-.poster:before { content: ""; position: absolute; inset: 0; z-index: 2; pointer-events: none;
-  background: linear-gradient(115deg, rgba(255,255,255,.16), rgba(255,255,255,0) 38%); }
-.p-t { font-family: var(--display); font-weight: 650; line-height: 1.04; padding: 9% 9% 0;
-  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
-  font-variation-settings: "SOFT" 100, "WONK" 1; letter-spacing: -.005em; }
-.p-y { font-family: var(--label); letter-spacing: .14em; margin-top: auto; padding: 0 9% 7%; opacity: .85; }
-.p-sm { width: 44px; flex: 0 0 44px; border-radius: 4px; }
+.p-t { font-weight: 800; line-height: 1.02; padding: 9% 9% 0; letter-spacing: -.02em;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.p-y { font-weight: 700; letter-spacing: .1em; margin-top: auto; padding: 0 9% 7%; opacity: .9; }
+.p-sm { width: 44px; flex: 0 0 44px; border-radius: 7px; border-width: 1.5px; box-shadow: none; }
 .poster.real .p-img { position: absolute; inset: 0; z-index: 1; background: center / cover no-repeat; }
-.poster.real:before { z-index: 2; }
-.sw-title { font-family: var(--display); font-size: 1.15rem; font-weight: 600; line-height: 1.15; margin-top: .1rem; }
+.sw-title { font-size: 1.25rem; font-weight: 800; line-height: 1.1; letter-spacing: -.02em; margin-top: .1rem; }
 .p-sm .p-t, .p-sm .p-y { display: none; }
-.p-md .p-t { font-size: .82rem; } .p-md .p-y { font-size: .72rem; }
-.p-lg { width: 92px; flex: 0 0 92px; } .p-lg .p-t { font-size: .8rem; } .p-lg .p-y { font-size: .7rem; }
+.p-md .p-t { font-size: .82rem; } .p-md .p-y { font-size: .7rem; }
+.p-lg { width: 92px; flex: 0 0 92px; transform: rotate(-4deg); } .p-lg .p-t { font-size: .8rem; } .p-lg .p-y { font-size: .68rem; }
 
-.wall { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px 10px; }
+.wall { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px 12px; }
 .wall-item { min-width: 0; }
-.wall-cap { font-size: .74rem; color: var(--muted); margin-top: .4rem; line-height: 1.3; }
-.reel { display: flex; gap: 12px; overflow-x: auto; scroll-snap-type: x mandatory; padding: 2px 2px 10px;
+.wall-cap { font-size: .76rem; font-weight: 600; color: var(--muted); margin-top: .5rem; line-height: 1.3; }
+.reel { display: flex; gap: 14px; overflow-x: auto; scroll-snap-type: x mandatory; padding: 4px 4px 12px;
   margin: 0 -1rem; padding-left: 1rem; scrollbar-width: none; }
 .reel::-webkit-scrollbar { display: none; }
 .reel-item { flex: 0 0 116px; scroll-snap-align: start; }
 .reel-item:last-child { margin-right: 1rem; }
-.reel-cap { margin-top: .5rem; font-size: .78rem; line-height: 1.5; }
+.reel-cap { margin-top: .55rem; font-size: .8rem; line-height: 1.5; }
 
-/* ---------- Film rows ---------- */
-.row { display: flex; align-items: center; gap: .85rem; padding: .7rem 0; border-bottom: 1px solid var(--line); }
-.row:last-child { border-bottom: 0; }
+/* ---------- Film rows: each one a little card ---------- */
+.row { display: flex; align-items: center; gap: .85rem; padding: .6rem .75rem; margin-bottom: 8px;
+  background: var(--surface); border: 2px solid var(--line); border-radius: 16px; }
 .row-body { flex: 1; min-width: 0; }
-.row-t { font-family: var(--display); font-size: 1.08rem; line-height: 1.22; font-weight: 500; }
-.row-t a { color: var(--cream) !important; text-decoration: none; }
-.row-y { font-family: var(--label); letter-spacing: .1em; color: var(--muted); font-size: .92rem; margin-left: .35rem; }
-.row-s { font-size: .82rem; color: var(--muted); margin-top: .25rem; line-height: 1.55; }
+.row-t { font-size: 1.05rem; line-height: 1.15; font-weight: 800; letter-spacing: -.01em; }
+.row-t a { color: var(--text) !important; text-decoration: none; }
+.row-y { font-weight: 600; color: var(--muted); font-size: .85rem; margin-left: .35rem; }
+.row-s { font-size: .84rem; color: var(--muted); margin-top: .25rem; line-height: 1.5; font-weight: 500; }
 .row-m { text-align: right; white-space: nowrap; }
-.chip { display: inline-block; font-family: var(--label); letter-spacing: .12em; font-size: .78rem;
-  padding: .2rem .55rem .1rem; border-radius: 999px; background: rgba(142,197,192,.14); color: var(--sea); }
-.chip-gold { background: rgba(242,193,78,.14); color: var(--gold); }
+.chip { display: inline-block; font-weight: 700; font-size: .8rem; padding: .15rem .6rem; border-radius: 999px;
+  background: var(--surface); border: 1.5px solid var(--line); color: var(--text); }
+.chip-gold { background: var(--butter); color: #1F1A17; }
 
 /* Stars: five glyphs, filled to the rating, so half stars read like Letterboxd */
 .st { font-family: var(--stars); letter-spacing: .04em; white-space: nowrap;
-  background: linear-gradient(90deg, var(--c, var(--gold)) calc(var(--r) * 20%), rgba(243,236,221,.16) 0);
+  background: linear-gradient(90deg, var(--text) calc(var(--r) * 20%), var(--track) 0);
   -webkit-background-clip: text; background-clip: text; color: transparent; }
-.dot { display: inline-block; width: .5rem; height: .5rem; border-radius: 50%; margin-right: .35rem;
-  vertical-align: .06rem; }
+.dot { display: inline-block; width: .6rem; height: .6rem; border-radius: 50%; margin-right: .4rem;
+  vertical-align: .02rem; border: 1.5px solid var(--line); box-sizing: border-box; }
 .rl { display: flex; align-items: center; gap: .4rem; }
-.rl .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--cream); }
+.rl .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 600; }
 
-/* ---------- Ticket ---------- */
+/* ---------- Ticket: tonight's pick ---------- */
 .ticket {
-  --notch: 66px; display: flex; color: var(--ink); margin: .2rem 0 1rem; border-radius: 16px;
-  background:
-    GRAIN_URL,
-    radial-gradient(120% 90% at 85% 0%, #FFE39A, rgba(255,227,154,0) 60%),
-    linear-gradient(160deg, #F7D06E, var(--gold) 50%, #E6A936);
-  -webkit-mask: radial-gradient(circle 11px at var(--notch) 0, #0000 98%, #000) top / 100% 51% no-repeat,
-                radial-gradient(circle 11px at var(--notch) 100%, #0000 98%, #000) bottom / 100% 51% no-repeat;
-          mask: radial-gradient(circle 11px at var(--notch) 0, #0000 98%, #000) top / 100% 51% no-repeat,
-                radial-gradient(circle 11px at var(--notch) 100%, #0000 98%, #000) bottom / 100% 51% no-repeat;
-  filter: drop-shadow(0 16px 30px rgba(242,193,78,.25));
+  --notch: 64px; display: flex; color: #1F1A17; margin: .4rem 0 1.1rem; border-radius: 20px; background: var(--butter);
+  border: 2px solid var(--line); box-shadow: 4px 4px 0 var(--line);
 }
 .ticket.a { animation: deal-a .55s cubic-bezier(.2,.9,.25,1.15) both; }
 .ticket.b { animation: deal-b .55s cubic-bezier(.2,.9,.25,1.15) both; }
 @keyframes deal-a { from { opacity: 0; transform: translateY(-18px) rotate(-2.5deg) scale(.96); } }
 @keyframes deal-b { from { opacity: 0; transform: translateY(-18px) rotate(2.5deg) scale(.96); } }
 .tk-stub { flex: 0 0 var(--notch); display: flex; flex-direction: column; align-items: center; justify-content: center;
-  border-right: 2px dashed rgba(17,25,38,.35); padding: 1rem 0; }
-.tk-stub span { writing-mode: vertical-rl; transform: rotate(180deg); font-family: var(--label);
-  letter-spacing: .3em; font-size: 1.35rem; line-height: 1; }
-.tk-stub small { writing-mode: vertical-rl; transform: rotate(180deg); font-family: var(--label);
-  letter-spacing: .2em; font-size: .72rem; opacity: .6; margin-top: .8rem; }
+  border-right: 2px dashed rgba(31,26,23,.45); padding: 1rem 0; }
+.tk-stub span { writing-mode: vertical-rl; transform: rotate(180deg); font-weight: 800; text-transform: uppercase;
+  letter-spacing: .22em; font-size: 1.05rem; line-height: 1; }
+.tk-stub small { writing-mode: vertical-rl; transform: rotate(180deg); font-weight: 700;
+  letter-spacing: .14em; font-size: .68rem; opacity: .6; margin-top: .8rem; }
 .tk-main { flex: 1; min-width: 0; padding: 1rem 1rem 1rem .95rem; }
-.tk-kick { font-family: var(--label); letter-spacing: .26em; font-size: .85rem; opacity: .7; }
-.tk-body { display: flex; gap: .9rem; margin-top: .55rem; align-items: flex-start; }
-.tk-title { font-family: var(--display); font-weight: 700; font-size: 1.55rem; line-height: 1.03;
-  letter-spacing: -.01em; overflow-wrap: anywhere; font-variation-settings: "SOFT" 80, "WONK" 1; }
-.tk-year { font-family: var(--label); letter-spacing: .16em; font-size: 1.05rem; margin-top: .35rem; opacity: .75; }
-.tk-why { font-size: .82rem; margin-top: .6rem; line-height: 1.35; opacity: .85; }
-.tk-why .st { --c: var(--ink); background: linear-gradient(90deg, var(--ink) calc(var(--r) * 20%), rgba(17,25,38,.2) 0);
+.tk-kick { font-weight: 800; letter-spacing: .16em; font-size: .72rem; text-transform: uppercase; opacity: .75; }
+.tk-body { display: flex; gap: .9rem; margin-top: .6rem; align-items: flex-start; }
+.tk-body .poster { --line: #1F1A17; }
+.tk-title { font-weight: 800; font-size: 1.6rem; line-height: 1; letter-spacing: -.035em; overflow-wrap: anywhere; }
+.tk-year { font-weight: 700; letter-spacing: .08em; font-size: .95rem; margin-top: .35rem; opacity: .75; }
+.tk-why { font-size: .84rem; font-weight: 500; margin-top: .55rem; line-height: 1.35; }
+.tk-why .st { background: linear-gradient(90deg, #1F1A17 calc(var(--r) * 20%), rgba(31,26,23,.2) 0);
   -webkit-background-clip: text; background-clip: text; }
-.tk-link { display: inline-flex; margin-top: .9rem; font-family: var(--label); letter-spacing: .14em; font-size: 1rem;
-  padding: .45rem .9rem .32rem; border-radius: 999px; background: var(--ink); color: var(--gold) !important;
-  text-decoration: none !important; }
-.tk-ghost { border-radius: 16px; padding: 1.4rem 1.2rem; text-align: center; margin: .2rem 0 1rem;
-  border: 1.5px dashed rgba(242,193,78,.35); color: var(--muted); }
-.tk-ghost b { display: block; font-family: var(--display); font-size: 1.3rem; color: var(--cream); font-weight: 500;
-  margin-bottom: .25rem; font-style: italic; }
+.tk-link { display: inline-flex; align-items: center; min-height: 2.5rem; margin-top: .9rem; font-weight: 800; font-size: .9rem;
+  padding: 0 1rem; border-radius: 12px; background: #1F1A17; color: #F6D776 !important; text-decoration: none !important; }
+.tk-ghost { border-radius: 20px; padding: 1.4rem 1.2rem; text-align: center; margin: .4rem 0 1.1rem;
+  border: 2.5px dashed var(--line); color: var(--muted); font-weight: 500; }
+.tk-ghost b { display: block; font-size: 1.35rem; color: var(--text); font-weight: 800; margin-bottom: .25rem; letter-spacing: -.02em; }
 
 /* ---------- Taste ---------- */
 .match { display: flex; flex-direction: column; align-items: center; text-align: center; margin: .6rem 0 .4rem; }
-.ring { display: grid; place-items: center; width: 196px; aspect-ratio: 1; position: relative;
+.ring { display: grid; place-items: center; width: 190px; aspect-ratio: 1; position: relative; border-radius: 50%;
+  border: 2px solid var(--line); box-shadow: 5px 5px 0 var(--line); background: var(--surface);
   animation: fill 1.4s cubic-bezier(.2,.8,.2,1) both; }
 @keyframes fill { from { --p: 0; } }
 .ring:before { content: ""; position: absolute; inset: 0; border-radius: 50%;
-  background: conic-gradient(var(--gold) 0, var(--sea) calc(var(--p) * 1%), rgba(243,236,221,.08) 0);
-  -webkit-mask: radial-gradient(farthest-side, #0000 calc(100% - 15px), #000 calc(100% - 14px));
-          mask: radial-gradient(farthest-side, #0000 calc(100% - 15px), #000 calc(100% - 14px));
-  filter: drop-shadow(0 0 14px rgba(242,193,78,.25)); }
-.ring b { font-family: var(--display); font-size: 3.4rem; font-weight: 600; line-height: 1; letter-spacing: -.02em; }
-.ring b small { font-size: 1.6rem; color: var(--gold); margin-left: .05em; }
-.ring span { display: block; font-family: var(--label); letter-spacing: .24em; font-size: .85rem; color: var(--muted);
-  margin-top: .3rem; }
-.verdict { font-family: var(--display); font-style: italic; font-size: 1.45rem; margin-top: 1rem; color: var(--cream); }
-.verdict-n { color: var(--muted); font-size: .88rem; margin-top: .3rem; }
-.trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 1.2rem 0 .2rem; }
-.trio div { border-radius: 14px; background: rgba(27,37,54,.8); box-shadow: inset 0 0 0 1px var(--line);
+  background: conic-gradient(var(--pink) calc(var(--p) * 1%), var(--surface) 0);
+  -webkit-mask: radial-gradient(farthest-side, #0000 calc(100% - 26px), #000 calc(100% - 25px));
+          mask: radial-gradient(farthest-side, #0000 calc(100% - 26px), #000 calc(100% - 25px)); }
+.ring:after { content: ""; position: absolute; inset: 24px; border-radius: 50%; border: 2px solid var(--line); }
+.ring > * { position: relative; z-index: 1; }
+.ring b { font-size: 3.1rem; font-weight: 800; line-height: 1; letter-spacing: -.05em; }
+.ring b small { font-size: 1.5rem; margin-left: .02em; }
+.ring span { display: block; font-weight: 700; letter-spacing: .14em; font-size: .7rem; color: var(--muted);
+  margin-top: .25rem; text-transform: uppercase; }
+.verdict { font-size: 1.9rem; font-weight: 800; letter-spacing: -.04em; margin-top: 1.1rem; color: var(--text); line-height: 1; }
+.verdict-n { color: var(--muted); font-size: .95rem; font-weight: 500; margin-top: .4rem; }
+.trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 1.2rem 0 .2rem; }
+.trio div { border-radius: 16px; background: var(--surface); border: 2px solid var(--line);
   padding: .8rem .5rem .7rem; text-align: center; }
-.trio b { display: block; font-family: var(--display); font-size: 1.45rem; font-weight: 600; line-height: 1.1;
+.trio div:nth-child(1) { background: var(--butter); color: #1F1A17; }
+.trio div:nth-child(1) span { color: #1F1A17; opacity: .75; }
+.trio b { display: block; font-size: 1.5rem; font-weight: 800; line-height: 1.1; letter-spacing: -.03em;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.trio span { font-family: var(--label); letter-spacing: .12em; font-size: .78rem; color: var(--muted); }
-.vs-gap { font-family: var(--display); font-size: 1.35rem; font-weight: 600; color: var(--coral); line-height: 1; }
-.vs-gap small { display: block; font-family: var(--label); letter-spacing: .12em; font-size: .7rem;
-  color: var(--muted); margin-top: .2rem; font-weight: 400; }
+.trio span { font-weight: 700; letter-spacing: .06em; font-size: .72rem; color: var(--muted); text-transform: uppercase; }
+.vs-gap { font-size: 1.35rem; font-weight: 800; color: var(--accent-ink); line-height: 1; }
+.vs-gap small { display: block; font-weight: 700; letter-spacing: .06em; font-size: .68rem;
+  color: var(--muted); margin-top: .2rem; text-transform: uppercase; }
 
 /* ---------- Stats: tale of the tape ---------- */
-.tape { border-radius: 18px; background: rgba(27,37,54,.75); box-shadow: inset 0 0 0 1px var(--line); padding: .4rem 1rem .6rem; }
+.tape { border-radius: 20px; background: var(--surface); border: 2px solid var(--line); box-shadow: 4px 4px 0 var(--line);
+  padding: .4rem 1rem .7rem; }
 .tape-h { display: flex; justify-content: space-between; align-items: center; padding: .7rem 0 .6rem;
-  border-bottom: 1px solid var(--line); font-family: var(--display); font-size: 1.15rem; font-weight: 600; }
-.tape-h i { font-style: italic; font-weight: 400; color: var(--muted); font-size: .95rem; }
-.tape-r { display: grid; grid-template-columns: 1fr auto 1fr; align-items: baseline; padding: .7rem 0 .25rem; }
-.tape-r b { font-family: var(--display); font-weight: 600; font-size: 1.3rem; }
+  border-bottom: 2px solid var(--line); font-size: 1.2rem; font-weight: 800; }
+.tape-h i { font-style: normal; font-weight: 700; color: var(--muted); font-size: .9rem; }
+.tape-r { display: grid; grid-template-columns: 1fr auto 1fr; align-items: baseline; padding: .75rem 0 .25rem; }
+.tape-r b { font-weight: 800; font-size: 1.35rem; letter-spacing: -.02em; }
 .tape-r b:last-of-type { text-align: right; }
-.tape-r span { font-family: var(--label); letter-spacing: .14em; font-size: .82rem; color: var(--muted); text-align: center; }
-.tape-bar { grid-column: 1 / -1; display: flex; height: 4px; border-radius: 4px; overflow: hidden; margin-top: .45rem;
-  background: rgba(243,236,221,.08); gap: 2px; }
+.tape-r span { font-weight: 700; letter-spacing: .06em; font-size: .72rem; color: var(--muted); text-align: center;
+  text-transform: uppercase; }
+.tape-bar { grid-column: 1 / -1; display: flex; height: 10px; border-radius: 6px; overflow: hidden; margin-top: .5rem;
+  border: 1.5px solid var(--line); gap: 0; }
 .tape-bar i { display: block; height: 100%; }
-.together { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
-.together div { border-radius: 18px; padding: 1rem; text-align: center;
-  background: linear-gradient(160deg, rgba(242,193,78,.16), rgba(142,197,192,.12)); box-shadow: inset 0 0 0 1px rgba(242,193,78,.2); }
-.together b { display: block; font-family: var(--display); font-size: 2.2rem; font-weight: 600; line-height: 1; }
-.together span { font-family: var(--label); letter-spacing: .14em; font-size: .82rem; color: var(--muted); }
+.tape-bar i + i { border-left: 1.5px solid var(--line); }
+.together { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+.together div { border-radius: 20px; padding: 1rem; text-align: center; color: #1F1A17;
+  border: 2px solid var(--line); box-shadow: 3px 3px 0 var(--line); }
+.together div:nth-child(1) { background: var(--green); } .together div:nth-child(2) { background: var(--blue); }
+.together b { display: block; font-size: 2.3rem; font-weight: 800; line-height: 1; letter-spacing: -.04em; }
+.together span { font-weight: 700; letter-spacing: .06em; font-size: .74rem; text-transform: uppercase; }
 
 /* Butterfly charts: one person to the left, the other to the right */
 .fly { margin-top: .2rem; }
-.fly-h { display: grid; grid-template-columns: 1fr 4.6rem 1fr; font-family: var(--label); letter-spacing: .14em;
-  font-size: .85rem; padding-bottom: .4rem; }
-.fly-h span:first-child { text-align: right; color: var(--gold); } .fly-h span:last-child { color: var(--sea); }
-.fly-r { display: grid; grid-template-columns: 1fr 4.6rem 1fr; align-items: center; height: 1.6rem; }
-.fly-l { text-align: center; font-family: var(--label); letter-spacing: .1em; font-size: .9rem; color: var(--muted); }
+.fly-h { display: grid; grid-template-columns: 1fr 4.6rem 1fr; font-weight: 800; font-size: .95rem; padding-bottom: .45rem; }
+.fly-h span:first-child { text-align: right; color: var(--pa-ink); } .fly-h span:last-child { color: var(--pb-ink); }
+.fly-r { display: grid; grid-template-columns: 1fr 4.6rem 1fr; align-items: center; height: 1.75rem; }
+.fly-l { text-align: center; font-weight: 700; font-size: .85rem; color: var(--muted); }
 .fly-l .st { font-size: .62rem; letter-spacing: 0; }
-.fly-a, .fly-b { display: flex; align-items: center; gap: .35rem; font-size: .72rem; color: var(--muted); }
+.fly-a, .fly-b { display: flex; align-items: center; gap: .35rem; font-size: .74rem; font-weight: 600; color: var(--muted); }
 .fly-a { flex-direction: row-reverse; }
-.fly-a i, .fly-b i { display: block; height: .95rem; min-width: 2px; }
+.fly-a i, .fly-b i { display: block; height: 1rem; min-width: 3px; border: 1.5px solid var(--line); box-sizing: border-box; }
 .fly-a i[style^="width:0.0%"], .fly-b i[style^="width:0.0%"] { display: none; }
-.fly-a i { background: linear-gradient(270deg, var(--gold), #E6A936); border-radius: 4px 2px 2px 4px; }
-.fly-b i { background: linear-gradient(90deg, var(--sea), #6FAFAA); border-radius: 2px 4px 4px 2px; }
+.fly-a i { background: var(--pa); border-radius: 6px 3px 3px 6px; }
+.fly-b i { background: var(--pb); border-radius: 3px 6px 6px 3px; }
 
 @media (prefers-reduced-motion: reduce) {
-  .marquee, .ticket, .ring { animation: none !important; }
+  .ticket, .ring { animation: none !important; }
 }
 </style>
-""".replace("GRAIN_URL", GRAIN)
+"""
 
 st.markdown(CSS, unsafe_allow_html=True)
+
+# ---------- Colour themes ----------
+# Each person picks a background (four light ones) or "After dark" in Settings. Everything is drawn with
+# these CSS variables, so a theme is just a different set of values.
+COLOUR_THEMES = {"lavender": "Lavender", "butter": "Butter", "blush": "Blush", "periwinkle": "Periwinkle", "dark": "Dark"}
+THEME_BG = {"lavender": "#ECE7F7", "butter": "#FBF1D3", "blush": "#F9E7E8", "periwinkle": "#DCE3FA"}
+LIGHT = {"surface": "#FFFFFF", "line": "#1F1A17", "text": "#1F1A17", "muted": "#5C544E", "track": "rgba(31,26,23,.12)",
+         "butter": "#F6D776", "pink": "#F49AB8", "blue": "#8EA2F2", "green": "#8DD3AE",
+         "cta-bg": "#1F1A17", "cta-fg": "#F6D776", "nav-bg": "#1F1A17", "nav-fg": "#F4F0FA",
+         "accent-ink": "#B8336A", "pa": "#F49AB8", "pb": "#8EA2F2", "pa-ink": "#B8336A", "pb-ink": "#3550C4"}
+DARK = {"bg": "#1D1828", "surface": "#2A2338", "line": "#0D0B13", "text": "#F6F1FB", "muted": "#BDB4CC",
+        "track": "rgba(246,241,251,.16)", "butter": "#F6DE8D", "pink": "#F2A7C3", "blue": "#A8B5FF", "green": "#A3E3C8",
+        "cta-bg": "#F6DE8D", "cta-fg": "#1D1828", "nav-bg": "#2A2338", "nav-fg": "#F6F1FB",
+        "accent-ink": "#F2A7C3", "pa": "#F2A7C3", "pb": "#A8B5FF", "pa-ink": "#F2A7C3", "pb-ink": "#A8B5FF"}
+
+
+def theme_tokens() -> dict:
+    ss = st.session_state
+    ss.setdefault("theme", "lavender")
+    ss.setdefault("auto_dark", True)
+    theme = ss.get("theme") or "lavender"
+    dark = theme == "dark" or (ss.get("auto_dark") and ss.get("phone_dark"))
+    if dark:
+        return {**DARK, "is-dark": "1"}
+    return {**LIGHT, "bg": THEME_BG.get(theme, THEME_BG["lavender"]), "is-dark": "0"}
+
+
+PREFS_JS = """
+export default function(component) {
+  const { data, setStateValue } = component;
+  const KEY = 'double-feature-prefs';
+  const mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  const dark = !!(mq && mq.matches);
+  let saved = {};
+  try { saved = JSON.parse(window.localStorage.getItem(KEY) || '{}') || {}; } catch (e) { saved = {}; }
+  if (data && data.save) {
+    try { window.localStorage.setItem(KEY, JSON.stringify(data.save)); } catch (e) {}
+  }
+  const seen = (data && data.seen) || {};
+  if (!seen.loaded || seen.dark !== dark) setStateValue('env', { dark, saved });
+}
+"""
+prefs_store = st.components.v2.component("prefs", js=PREFS_JS, isolate_styles=False)
+
+
+def on_prefs():
+    """The browser told us its saved settings and whether the phone is in dark mode."""
+    env = (st.session_state.get("prefs") or {}).get("env") or {}
+    st.session_state.phone_dark = bool(env.get("dark"))
+    if not st.session_state.get("prefs_loaded"):
+        st.session_state.prefs_loaded = True
+        saved = env.get("saved") or {}
+        if saved.get("theme") in COLOUR_THEMES:
+            st.session_state.theme = saved["theme"]
+        if isinstance(saved.get("auto"), bool):
+            st.session_state.auto_dark = saved["auto"]
+        if saved.get("posters") in ("art", "real"):
+            st.session_state.poster_style = saved["posters"]
+
+
+TOKENS = theme_tokens()
+st.markdown("<style>:root{" + ";".join(f"--{k}:{v}" for k, v in TOKENS.items()) + "}</style>",
+            unsafe_allow_html=True)
+_ss = st.session_state
+prefs_store(key="prefs", on_env_change=on_prefs,
+            data={"seen": {"loaded": bool(_ss.get("prefs_loaded")), "dark": bool(_ss.get("phone_dark"))},
+                  "save": ({"theme": _ss.get("theme") or "lavender", "auto": bool(_ss.get("auto_dark")),
+                            "posters": _ss.get("poster_style") or "art"} if _ss.get("prefs_loaded") else None)})
 
 COLOURS = {}
 esc = html.escape
@@ -768,7 +888,16 @@ def m_spiral(s):  # dreams, vertigo
         t = i / 140 * 6 * math.pi
         rr = 1 + t * 1.45
         pts.append((50 + rr * math.cos(t), 104 + rr * math.sin(t)))
-    return [_bar(*pts[i], *pts[i + 1], 2.2) for i in range(len(pts) - 1)]
+    left, right = [], []  # one thick line, drawn as a single shape (small and fast)
+    for i, (x, y) in enumerate(pts):
+        x0, y0 = pts[max(i - 1, 0)]
+        x1, y1 = pts[min(i + 1, len(pts) - 1)]
+        dx, dy = x1 - x0, y1 - y0
+        n = math.hypot(dx, dy) or 1
+        ox, oy = -dy / n * 1.1, dx / n * 1.1
+        left.append((x + ox, y + oy))
+        right.append((x - ox, y - oy))
+    return [_P(left + right[::-1])]
 
 
 def m_bars(s):  # prison, cage
@@ -957,9 +1086,19 @@ def _shape_colour(col, palette):
     return {"c": c, "i": ink, "k": "#000000", "t": top}.get(col, col)
 
 
-@functools.lru_cache(maxsize=4096)
 def poster_svg(k, name, genres=(), avoid_gold=False):
     """(css background, text colour) for the generated poster."""
+    memo = _memo()
+    key = ("svg", k, name, genres, avoid_gold)
+    val = memo.get(key)
+    if val is None:
+        if len(memo) > 20000:
+            memo.clear()
+        val = memo[key] = _poster_svg(k, name, genres, avoid_gold)
+    return val
+
+
+def _poster_svg(k, name, genres=(), avoid_gold=False):
     fn, pal, h = poster_design(k, name, genres)
     if avoid_gold and pal == "gold":
         pal = "dusk"
@@ -1056,7 +1195,7 @@ def star_bar(r, colour=None) -> str:
 
 
 def dot(name: str) -> str:
-    return f'<span class="dot" style="background:{COLOURS.get(name, GOLD)}"></span>'
+    return f'<span class="dot" style="background:{COLOURS.get(name, "var(--pa)")}"></span>'
 
 
 def rating_line(name: str, r) -> str:
@@ -1090,10 +1229,21 @@ def note(text: str):
     md(f'<div class="note">{text}</div>')
 
 
+MAX_SHOWN = 120  # even with "Show all", a list never draws more than this (keeps phones quick)
+
+
 def show_all(keys, key: str, limit: int):
     keys = list(keys)
-    shown = keys if st.session_state.get(key) else keys[:limit]
+    shown = keys[:MAX_SHOWN] if st.session_state.get(key) else keys[:limit]
+    films = globals().get("cat")
+    if films is not None:
+        prefetch_posters([(k, str(films.at[k, "Name"]), films.at[k, "Year"]) for k in shown if k in films.index])
     return shown, len(keys) > limit
+
+
+def show_all_toggle(keys, key: str):
+    n = len(keys)
+    st.toggle(f"Show all {n}" if n <= MAX_SHOWN else f"Show the top {MAX_SHOWN}", key=key)
 
 
 def film_rows(keys, key: str, sub=None, meta=None, limit: int = 10):
@@ -1106,7 +1256,7 @@ def film_rows(keys, key: str, sub=None, meta=None, limit: int = 10):
                     f'<span class="row-y">{year_str(cat.at[k, "Year"])}</span></div>{s}</div>{m}</div>')
     md("".join(rows))
     if more:
-        st.toggle(f"Show all {len(keys)}", key=key)
+        show_all_toggle(keys, key)
 
 
 def poster_wall(keys, key: str, cap=None, limit: int = 9):
@@ -1119,12 +1269,16 @@ def poster_wall(keys, key: str, cap=None, limit: int = 9):
     )
     md(f'<div class="wall">{items}</div>')
     if more:
-        st.toggle(f"Show all {len(keys)}", key=key)
+        show_all_toggle(keys, key)
 
 
-def marquee(kicker: str, title: str, sub: str):
-    md(f'<div class="marquee"><div class="marquee-in"><div class="mq-kick">{kicker}</div>'
-       f'<div class="mq-title">{title}</div><div class="mq-sub">{sub}</div></div></div>')
+def marquee(kicker: str, title: str, sub: str = ""):
+    """The header on every screen: wordmark, Settings, a small label, a big title and a line under it."""
+    md('<div class="marquee"><div class="mq-brand">double<span>·</span>feature</div>'
+       + (f'<div class="mq-kick">{kicker}</div>' if kicker else "")
+       + f'<div class="mq-title">{title}</div>'
+       + (f'<div class="mq-sub">{sub}</div>' if sub else "") + '</div>')
+    settings_menu()
 
 
 # ---------- Tickets ----------
@@ -1205,19 +1359,41 @@ def real_poster_url(k, size="md"):
 def prefetch_posters(items):
     """When real posters are switched on, look up the films about to be shown."""
     if want_real_posters() and items:
-        remember_posters(film_infos(items))
+        remember_posters(film_infos(items, wait=4.0))
+
+
+def _pick_theme():
+    st.session_state.theme = st.session_state.get("theme_pick") or st.session_state.get("theme") or "lavender"
+
+
+def _pick_auto():
+    st.session_state.auto_dark = bool(st.session_state.get("auto_pick"))
 
 
 def settings_menu():
-    """Per-person settings: poster style and streaming country. Hidden entirely when there's nothing to set."""
-    if not tmdb_on():
-        return
-    with st.popover("Settings", icon=":material/tune:"):
-        st.segmented_control("Posters", ["art", "real"], default="art",
-                             key="poster_style", format_func={"art": "Minimal art", "real": "Real posters"}.get)
-        region = current_region()
-        st.selectbox("Streaming in", list(REGIONS), index=list(REGIONS).index(region),
-                      format_func=REGIONS.get, key="region")
+    """Per-person settings: colour theme, and (with film details on) poster style and streaming country.
+    The theme lives in its own session keys, so it survives screens that don't show this menu."""
+    ss = st.session_state
+    with st.container(key="settings_wrap"):
+        with st.popover("Settings", icon=":material/palette:"):
+            ss.theme_pick = ss.get("theme") or "lavender"
+            ss.auto_pick = bool(ss.get("auto_dark", True))
+            st.pills("Colour", list(COLOUR_THEMES), key="theme_pick", format_func=COLOUR_THEMES.get, on_change=_pick_theme)
+            st.toggle("Go dark when my phone is in dark mode", key="auto_pick", on_change=_pick_auto)
+            if tmdb_on():
+                ss.setdefault("poster_style", "art")
+                st.segmented_control("Posters", ["art", "real"], key="poster_style",
+                                     format_func={"art": "Minimal art", "real": "Real posters"}.get)
+                region = current_region()
+                st.selectbox("Streaming in", list(REGIONS), index=list(REGIONS).index(region),
+                             format_func=REGIONS.get, key="region")
+
+
+@st.cache_resource
+def _memo():
+    """Small shared memo (poster SVGs, fonts). Survives reruns, unlike module-level caches,
+    because Streamlit re-runs this script as a fresh module every time."""
+    return {}
 
 
 @st.cache_resource
@@ -1225,18 +1401,49 @@ def _film_store():
     return {"lock": threading.Lock(), "films": {}}
 
 
-def _tmdb_get(path, **params):
-    key = str(_secret("TMDB_API_KEY") or "")
+@st.cache_resource
+def _http():
+    """One shared connection pool, so lookups reuse connections instead of a new handshake each time."""
+    sess = requests.Session()
+    sess.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=16))
+    return sess
+
+
+@st.cache_resource
+def _tmdb_pool():
+    """One small worker pool for every user, so the app as a whole stays under TMDB's rate limit."""
+    return concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="tmdb")
+
+
+def _tmdb_get(ctx, path, **params):
+    """GET from TMDB. Returns the JSON, or None if it failed (so nothing wrong gets cached)."""
+    sess, key, store = ctx
     headers = {"accept": "application/json"}
     if key.startswith("eyJ"):  # the long "API read access token"
         headers["Authorization"] = f"Bearer {key}"
     else:                      # the short "API key"
         params["api_key"] = key
-    try:
-        r = requests.get(TMDB_API + path, params=params, headers=headers, timeout=6)
-        return r.json() if r.ok else None
-    except (requests.RequestException, ValueError):
-        return None
+    for attempt in range(2):
+        try:
+            r = sess.get(TMDB_API + path, params=params, headers=headers, timeout=(3, 5))
+        except requests.RequestException:
+            return None
+        if r.status_code == 429 and attempt == 0:  # rate limited: wait as asked (briefly), then try once more
+            try:
+                time.sleep(min(float(r.headers.get("Retry-After") or 1), 2))
+            except ValueError:
+                time.sleep(1)
+            continue
+        if r.status_code == 401:  # bad key: stop asking for a while
+            store["down_until"] = time.time() + 600
+            return None
+        if not r.ok:
+            return None
+        try:
+            return r.json()
+        except ValueError:
+            return None
+    return None
 
 
 def _clean_service(name: str) -> str:
@@ -1255,78 +1462,137 @@ def _fake_info(name, year):
             "providers": {cc: {"stream": sorted(set(stream)), "rent": bool(h % 2), "link": ""} for cc in REGIONS}}
 
 
-def _fetch_info(name, year):
+def _fetch_info(ctx, name, year):
     """Look a film up on TMDB. Returns a dict, {} if not found, or None if TMDB couldn't be reached."""
     if FAKE_TMDB:
         return _fake_info(name, year)
-    # Search both with and without the year and pool the results. Letterboxd often dates a film by its
-    # festival premiere while TMDB uses the cinema release (or the other way round), so a year-only
-    # search can miss the real film and land on a short with the same name.
-    by_year = _tmdb_get("/search/movie", query=name, year=year) if year else None
-    plain = _tmdb_get("/search/movie", query=name)
-    if by_year is None and plain is None:
+    want = title_key(name) or str(name).casefold()
+
+    def same_title(h):
+        return want in (title_key(h.get("title", "")) or str(h.get("title", "")).casefold(),
+                        title_key(h.get("original_title", "")) or str(h.get("original_title", "")).casefold())
+
+    def year_off(h):
+        y = (h.get("release_date") or "")[:4]
+        return abs(int(y) - int(year)) if (year and y.isdigit()) else 5
+
+    # Search by title first. Only if that finds no film with this title within a year either side, also
+    # search with the year: Letterboxd sometimes dates a film by its festival premiere and TMDB by its
+    # cinema release, so neither search alone is reliable.
+    plain = _tmdb_get(ctx, "/search/movie", query=name)
+    if plain is None:
         return None
-    hits = list({h["id"]: h for r in (plain, by_year) if r for h in (r.get("results") or []) if h.get("id")}.values())
+    hits = [h for h in (plain.get("results") or []) if h.get("id")]
+    if year and not any(same_title(h) and year_off(h) <= 1 for h in hits):
+        by_year = _tmdb_get(ctx, "/search/movie", query=name, year=year)
+        if by_year is None:
+            return None
+        seen = {h["id"] for h in hits}
+        hits += [h for h in (by_year.get("results") or []) if h.get("id") and h["id"] not in seen]
     if not hits:
         return {}
-    want = title_key(name)
 
     def rank(h):
-        same = want in (title_key(h.get("title", "")), title_key(h.get("original_title", "")))
-        y = (h.get("release_date") or "")[:4]
-        off = abs(int(y) - int(year)) if (year and y.isdigit()) else 5
+        off = year_off(h)
         # A year either side counts as a match; among those, the film people have actually seen wins.
-        return (not same, off > 1, -(h.get("vote_count") or 0), off, -(h.get("popularity") or 0))
+        return (not same_title(h), off > 1, -(h.get("vote_count") or 0), off, -(h.get("popularity") or 0))
 
-    best = sorted(hits, key=rank)[0]
-    det = _tmdb_get(f"/movie/{best['id']}") or {}
-    prov = (_tmdb_get(f"/movie/{best['id']}/watch/providers") or {}).get("results") or {}
+    best = min(hits, key=rank)
+    det = _tmdb_get(ctx, f"/movie/{best['id']}")
+    prov = _tmdb_get(ctx, f"/movie/{best['id']}/watch/providers")
+    if det is None or prov is None:  # partial failure: don't cache half the details
+        return None
     providers = {}
-    for cc, v in prov.items():
+    for cc, v in (prov.get("results") or {}).items():
+        if cc not in REGIONS:  # only the countries the app offers, to keep memory small
+            continue
         streams = sorted(v.get("flatrate", []) + v.get("free", []) + v.get("ads", []),
                          key=lambda p: p.get("display_priority", 99))
         names = list(dict.fromkeys(_clean_service(p.get("provider_name", "")) for p in streams if p.get("provider_name")))
         providers[cc] = {"stream": names, "rent": bool(v.get("rent") or v.get("buy")), "link": v.get("link") or ""}
     return {"id": best["id"], "poster": best.get("poster_path") or det.get("poster_path"),
             "runtime": det.get("runtime") or None,
-            "genres": [g["name"] for g in det.get("genres", [])][:3], "providers": providers}
+            "genres": [g["name"] for g in det.get("genres") or [] if g.get("name")][:3], "providers": providers}
 
 
-DETAIL_VERSION = 2  # bump when the lookup changes, so details cached by older code are fetched again
+DETAIL_VERSION = 3  # bump when the lookup changes, so details cached by older code are fetched again
 
 
 def _detail_key(name, year):
-    return f"v{DETAIL_VERSION}|{title_key(name)}|{year}"
+    # titles in other scripts (e.g. Japanese) have an empty title_key, so fall back to the plain title
+    return f"v{DETAIL_VERSION}|{title_key(name) or str(name).strip().casefold()}|{year}"
 
 
-def film_infos(items, limit=150):
-    """items: [(key, name, year)]. Returns {key: info}, fetching anything new in parallel."""
+def _fetch_and_store(ctx, name, year, ck):
+    store = ctx[2]
+    if store.get("down_until", 0) > time.time():  # queued before TMDB was switched off: skip quietly
+        with store["lock"]:
+            store["pending"].pop(ck, None)
+        return None
+    try:
+        info = _fetch_info(ctx, name, year)
+    except Exception:
+        info = None
+    now = time.time()
+    with store["lock"]:
+        store["pending"].pop(ck, None)
+        if info is not None:
+            if len(store["films"]) > 5000:
+                store["films"].clear()
+            store["films"][ck] = (now, info)
+            store["failed"].pop(ck, None)
+            store["last_ok"] = now
+        else:
+            store["failed"][ck] = now  # don't retry this film for a couple of minutes
+            if len(store["failed"]) > 5000:
+                store["failed"].clear()
+            # Lots of failures in the last minute and no successes at all: an outage. Stop asking for 10 minutes.
+            recent = [t for t in store.get("fail_times", []) if now - t < 60] + [now]
+            store["fail_times"] = recent
+            if len(recent) >= 25 and now - store.get("last_ok", 0) > 60:
+                store["down_until"], store["fail_times"] = now + 600, []
+    return info
+
+
+def film_infos(items, limit=150, wait=8.0):
+    """items: [(key, name, year)]. Returns {key: info} for whatever is known or arrives within `wait`
+    seconds. Slower lookups carry on in the background and show up on the next rerun."""
     if not tmdb_on() or not items:
         return {}
     store, now, out, todo = _film_store(), time.time(), {}, []
-    offline = store.get("down_until", 0) > now  # TMDB failing (bad key or outage): don't keep retrying
+    store.setdefault("pending", {})
+    store.setdefault("failed", {})
     for k, name, year in items:
         y = _norm_year(year)
         ck = _detail_key(name, y)
         hit = store["films"].get(ck)
         if hit and now - hit[0] < DETAIL_TTL:
             out[k] = hit[1]
-        else:
+        elif now - store["failed"].get(ck, 0) > 120:
             todo.append((k, name, y, ck))
-    todo = [] if offline else todo[:limit]
-    if todo:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool_:
-            results = list(pool_.map(lambda t: _fetch_info(t[1], t[2]), todo))
-        with store["lock"]:
-            if len(store["films"]) > 5000:
-                store["films"].clear()
-            for (k, _, _, ck), info in zip(todo, results):
-                if info is not None:
-                    store["films"][ck] = (now, info)
-                    out[k] = info
-            if all(r is None for r in results):
-                store["down_until"] = now + 600  # try again in 10 minutes
+    if not todo or store.get("down_until", 0) > now:  # TMDB failing (bad key or outage): don't keep retrying
+        return out
+    ctx = (_http(), str(_secret("TMDB_API_KEY") or ""), store)
+    futs = {}
+    with store["lock"]:
+        for k, name, y, ck in todo[:limit]:
+            fut = store["pending"].get(ck)
+            if fut is None:  # not already being looked up for someone else
+                fut = store["pending"][ck] = _tmdb_pool().submit(_fetch_and_store, ctx, name, y, ck)
+            futs[k] = fut
+    done, _ = concurrent.futures.wait(list(futs.values()), timeout=wait)
+    for k, fut in futs.items():
+        if fut in done and fut.result() is not None:
+            out[k] = fut.result()
     return out
+
+
+@st.fragment(run_every=3)
+def details_catchup(items):
+    """Some details were still loading when the page was drawn: redraw once they've arrived."""
+    pending = _film_store().get("pending", {})
+    if not any(_detail_key(n, _norm_year(y)) in pending for _, n, y in items):
+        st.rerun(scope="app")
 
 
 def fmt_runtime(m) -> str:
@@ -1372,17 +1638,74 @@ def attribution():
 SHARE_FONTS = Path(__file__).parent / "static" / "share"
 
 
-@functools.lru_cache(maxsize=64)
-def _font(name, size):
-    """Share-image font. If the font file is missing (e.g. static/share wasn't deployed), fall back to
-    Pillow's built-in font rather than crashing the page."""
-    try:
-        return ImageFont.truetype(str(SHARE_FONTS / f"{name}.ttf"), size)
-    except OSError:
+def _load_font(name, size):
+    memo = _memo()
+    key = ("font", name, size)
+    font = memo.get(key)
+    if font is None:
         try:
-            return ImageFont.load_default(size=size)
+            font = ImageFont.truetype(str(SHARE_FONTS / f"{name}.ttf"), size)
+        except OSError:
+            font = False  # missing file: remembered, so we don't keep trying
+        memo[key] = font
+    return font or None
+
+
+def _covers(font, text) -> bool:
+    """True if the font has a real glyph for every character (missing ones would print as boxes).
+    Checked with Pillow's basic text engine, which draws a missing character as the font's 'no glyph' box."""
+    memo = _memo()
+    probe_key = ("probe", font.path)
+    probe = memo.get(probe_key)
+    if probe is None:
+        try:
+            probe = ImageFont.truetype(font.path, 24, layout_engine=ImageFont.Layout.BASIC)
+            nd = bytes(probe.getmask("\U000E0FFF"))
+        except Exception:
+            return True
+        probe = memo[probe_key] = (probe, nd)
+    probe_font, notdef = probe
+    for ch in set(text):
+        if ch.isspace():
+            continue
+        key = ("glyph", font.path, ch)
+        ok = memo.get(key)
+        if ok is None:
+            ok = memo[key] = bytes(probe_font.getmask(ch)) != notdef
+        if not ok:
+            return False
+    return True
+
+
+def _missing(font, text) -> set:
+    """Characters in text that this font can't draw."""
+    return {ch for ch in set(text) if not ch.isspace() and not _covers(font, ch)}
+
+
+def _fit(name, size, text):
+    """(font, text) for share images: the brand font if it can draw everything, else a fallback font.
+    Characters no available font has (e.g. Japanese) are left out rather than printed as boxes."""
+    options = [_load_font(n, size) for n in
+               ((name, "fallback-serif", "fallback-sans") if name.startswith("fraunces") else (name, "fallback-sans"))]
+    options = [f for f in options if f is not None]
+    if not options:
+        return _font(name, size), text
+    best = min(options, key=lambda f: len(_missing(f, text)))  # first font with the fewest gaps
+    gaps = _missing(best, text)
+    if gaps:
+        text = " ".join("".join(ch for ch in text if ch not in gaps).split())
+    return best, text
+
+
+def _font(name, size, text=""):
+    """Share-image font. If the font files are missing entirely, Pillow's built-in font is used, never an error."""
+    font = _fit(name, size, text)[0] if text else _load_font(name, size)
+    if font is None:
+        try:
+            font = ImageFont.load_default(size=size)
         except TypeError:  # very old Pillow
-            return ImageFont.load_default()
+            font = ImageFont.load_default()
+    return font
 
 
 def _hex(c):
@@ -1401,7 +1724,15 @@ def _spaced(draw, xy_center, text, font, fill, spacing):
 
 
 def _wrap(draw, text, font, max_w, max_lines):
-    words, lines, cur = text.split(), [], ""
+    words, lines, cur = [], [], ""
+    for w in text.split():  # break up single words too long for a line
+        while draw.textlength(w, font=font) > max_w and len(w) > 1:
+            cut = len(w) - 1
+            while cut > 1 and draw.textlength(w[:cut], font=font) > max_w:
+                cut -= 1
+            words.append(w[:cut])
+            w = w[cut:]
+        words.append(w)
     for w in words:
         test = f"{cur} {w}".strip()
         if draw.textlength(test, font=font) <= max_w or not cur:
@@ -1418,9 +1749,9 @@ def _wrap(draw, text, font, max_w, max_lines):
     return lines
 
 
-def _poster_image(k, name, w, h, year=None):
+def _poster_image(k, name, w, h, year=None, genres=None):
     """The same screen-print poster as in the app, drawn with Pillow."""
-    genres = _known_genres(name, year, k)
+    genres = _known_genres(name, year, k) if genres is None else genres
     _, pal, _ = poster_design(str(k), str(name), genres)
     top, bottom, _, ink = (_hex(x) for x in PALETTES[pal])
     img = Image.new("RGB", (w, h))
@@ -1430,9 +1761,9 @@ def _poster_image(k, name, w, h, year=None):
         d.line([(0, y), (w, y)], fill=tuple(int(a + (b - a) * t) for a, b in zip(top, bottom)))
     img, _ = draw_poster_art(img, str(k), str(name), genres)
     d = ImageDraw.Draw(img)
-    f = _font("fraunces-600", int(w * .11))
+    f, title = _fit("bricolage-800", int(w * .11), name)
     y = int(h * .07)
-    for line in _wrap(d, name, f, w * .82, 4):
+    for line in _wrap(d, title, f, w * .82, 4) if title else []:
         d.text((w * .09, y), line, font=f, fill=ink)
         y += int(w * .125)
     mask = Image.new("L", (w, h), 0)
@@ -1442,39 +1773,56 @@ def _poster_image(k, name, w, h, year=None):
     return out
 
 
+# Share images use the light lavender look whatever theme the phone is on, so they always read well
+SH = {"bg": "#ECE7F7", "ink": "#1F1A17", "muted": "#5C544E", "white": "#FFFFFF",
+      "butter": "#F6D776", "pink": "#F49AB8", "blue": "#8EA2F2", "green": "#8DD3AE"}
+
+
+def _pill(d, cx, y, text, font, fill, pad_x=26, h=62, outline=6):
+    """A sticker-style pill centred on cx, with its top at y."""
+    w = d.textlength(text, font=font) + pad_x * 2
+    d.rounded_rectangle([cx - w / 2, y, cx + w / 2, y + h], radius=h / 2, fill=_hex(fill), outline=_hex(SH["ink"]),
+                        width=outline)
+    box = font.getbbox(text)
+    d.text((cx - (box[2] - box[0]) / 2 - box[0], y + (h - (box[3] - box[1])) / 2 - box[1]), text, font=font,
+           fill=_hex(SH["ink"]))
+
+
 def _share_canvas(kicker):
     W, H = 1080, 1350
-    img = Image.new("RGB", (W, H), _hex("#111926"))
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse([W * .05, -H * .35, W * .95, H * .35], fill=(242, 193, 78, 70))
-    glow = glow.filter(ImageFilter.GaussianBlur(140))
-    img.paste(glow, (0, 0), glow)
+    img = Image.new("RGB", (W, H), _hex(SH["bg"]))
     d = ImageDraw.Draw(img)
-    # marquee bulbs around the edge
-    m, step = 34, 30
-    for x in range(m, W - m + 1, step):
-        for y in (m, H - m):
-            d.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(255, 236, 180))
-    for y in range(m + step, H - m, step):
-        for x in (m, W - m):
-            d.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(255, 236, 180))
-    d.rounded_rectangle([m + 22, m + 22, W - m - 22, H - m - 22], radius=26, outline=(242, 193, 78), width=2)
-    _spaced(d, (W / 2, 104), kicker.upper(), _font("bebas-neue", 46), _hex(GOLD), 10)
-    _spaced(d, (W / 2, H - 132), "DOUBLE FEATURE", _font("bebas-neue", 34), _hex(CREAM), 8)
-    f = _font("dm-sans-500", 24)
+    ink = _hex(SH["ink"])
+    # a few confetti stickers around the edges
+    for x, y, r, col in ((90, 110, 16, "pink"), (980, 150, 13, "green"), (70, 640, 12, "blue"), (1000, 700, 16, "butter"),
+                         (60, 1190, 13, "butter"), (1010, 1200, 12, "pink")):
+        d.ellipse([x - r, y - r, x + r, y + r], fill=_hex(SH[col]), outline=ink, width=4)
+    f, kick = _fit("bricolage-800", 40, kicker.upper())
+    _pill(d, W / 2, 70, kick, f, SH["butter"])
+    f = _font("bricolage-800", 44, "double·feature")
+    brand = "double·feature"
+    d.text((W / 2 - d.textlength(brand, font=f) / 2, H - 150), brand, font=f, fill=ink)
+    f = _font("bricolage-500", 26)
     url = "double-feature.streamlit.app"
-    d.text((W / 2 - d.textlength(url, font=f) / 2, H - 88), url, font=f, fill=_hex(MUTED))
+    d.text((W / 2 - d.textlength(url, font=f) / 2, H - 92), url, font=f, fill=_hex(SH["muted"]))
     return img, d
 
 
-@st.cache_data(show_spinner=False, max_entries=200)
+@st.cache_data(show_spinner=False, max_entries=100, ttl=24 * 3600)
+def _poster_bytes(url):
+    """The poster file itself (a small JPEG). Raises on failure, so failures are never cached."""
+    r = _http().get(url, timeout=5)
+    r.raise_for_status()
+    Image.open(io.BytesIO(r.content)).verify()
+    return r.content
+
+
 def _fetch_poster(url, w, h):
     """Download a real poster for a share image, cropped to fill w×h with rounded corners."""
-    if not url.startswith("https://"):
+    if not str(url).startswith("https://"):
         return None
     try:
-        r = requests.get(url, timeout=6)
-        src = Image.open(io.BytesIO(r.content)).convert("RGB")
+        src = Image.open(io.BytesIO(_poster_bytes(url))).convert("RGB")
     except Exception:
         return None
     scale = max(w / src.width, h / src.height)
@@ -1489,30 +1837,39 @@ def _fetch_poster(url, w, h):
 
 
 def share_film_png(kicker, names_line, k, name, year, meta, stream, poster_url=""):
+    return _share_film_png(kicker, names_line, k, name, year, meta, stream, poster_url,
+                           _known_genres(name, year, k))
+
+
+@st.cache_data(show_spinner=False, max_entries=60, ttl=6 * 3600)
+def _share_film_png(kicker, names_line, k, name, year, meta, stream, poster_url, genres):
     img, d = _share_canvas(kicker)
     W = img.width
+    ink = _hex(SH["ink"])
     if names_line:
-        f = _font("fraunces-italic", 48)
-        d.text((W / 2 - d.textlength(names_line, font=f) / 2, 168), names_line, font=f, fill=_hex(CREAM))
-    pw, ph = 440, 660
-    shadow = Image.new("RGBA", (pw + 120, ph + 120), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).rounded_rectangle([60, 80, pw + 60, ph + 80], radius=24, fill=(0, 0, 0, 170))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(28))
-    img.paste(shadow, (int(W / 2 - pw / 2 - 60), 250 - 60), shadow)
-    poster_ = (_fetch_poster(poster_url, pw, ph) if poster_url else None) or _poster_image(k, name, pw, ph, year)
-    img.paste(poster_, (int(W / 2 - pw / 2), 250), poster_)
-    y = 950
-    ft = _font("fraunces-600", 66)
-    for line in _wrap(d, name, ft, W - 220, 2):
-        d.text((W / 2 - d.textlength(line, font=ft) / 2, y), line, font=ft, fill=_hex(CREAM))
-        y += 76
+        f, names_line = _fit("bricolage-700", 46, names_line)
+        d.text((W / 2 - d.textlength(names_line, font=f) / 2, 160), names_line, font=f, fill=ink)
+    ft, title = _fit("bricolage-800", 70, name)
+    lines = _wrap(d, title, ft, W - 200, 2) if title else []
+    ph = 660 - 80 * max(len(lines) - 1, 0)  # a two-line title gets a shorter poster so nothing runs into the footer
+    pw = int(ph * 2 / 3)
+    px, py = int(W / 2 - pw / 2), 240
+    d.rounded_rectangle([px + 14, py + 14, px + pw + 14, py + ph + 14], radius=22, fill=ink)  # hard sticker shadow
+    poster_ = (_fetch_poster(poster_url, pw, ph) if poster_url else None) or _poster_image(k, name, pw, ph, year, genres)
+    img.paste(poster_, (px, py), poster_)
+    d.rounded_rectangle([px, py, px + pw, py + ph], radius=int(pw * .04), outline=ink, width=6)
+    y = py + ph + 40
+    for line in lines:
+        d.text((W / 2 - d.textlength(line, font=ft) / 2, y), line, font=ft, fill=ink)
+        y += 74
     sub = " · ".join(x for x in (str(year or ""), meta) if x)
     if sub:
-        _spaced(d, (W / 2, y + 10), sub.upper(), _font("bebas-neue", 36), _hex(MUTED), 4)
-        y += 56
+        f, sub = _fit("bricolage-700", 32, sub)
+        d.text((W / 2 - d.textlength(sub, font=f) / 2, y + 8), sub, font=f, fill=_hex(SH["muted"]))
+        y += 52
     if stream:
-        f = _font("dm-sans-500", 30)
-        d.text((W / 2 - d.textlength(stream, font=f) / 2, y + 10), stream, font=f, fill=_hex(GOLD))
+        f, stream = _fit("bricolage-700", 30, stream)
+        _pill(d, W / 2, y + 16, stream, f, SH["green"], pad_x=22, h=54, outline=4)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=88, optimize=True)
     return buf.getvalue()
@@ -1522,29 +1879,33 @@ def share_film_png(kicker, names_line, k, name, year, meta, stream, poster_url="
 def share_taste_png(score, verdict, a, b, n_both, gap, tougher):
     img, d = _share_canvas("Taste match")
     W = img.width
-    f = _font("fraunces-italic", 52)
-    names = f"{a} & {b}"
-    d.text((W / 2 - d.textlength(names, font=f) / 2, 170), names, font=f, fill=_hex(CREAM))
-    cx, cy, R, wd = W / 2, 560, 250, 34
-    box = [cx - R, cy - R, cx + R, cy + R]
-    d.ellipse(box, outline=(43, 52, 68), width=wd)
-    gold, sea = _hex(GOLD), _hex(SEA)
-    end = int(360 * score / 100)
-    for i in range(end):  # gold fading to sea-green, like the ring in the app
-        t = i / max(end, 1)
-        col = tuple(int(g + (s - g) * t) for g, s in zip(gold, sea))
-        d.arc(box, start=-90 + i, end=-90 + i + 1.5, fill=col, width=wd)
-    big = _font("fraunces-600", 190)
+    ink = _hex(SH["ink"])
+    f, names = _fit("bricolage-700", 50, f"{a} + {b}")
+    d.text((W / 2 - d.textlength(names, font=f) / 2, 170), names, font=f, fill=ink)
+    cx, cy, R = W / 2, 540, 250
+    d.ellipse([cx - R + 16, cy - R + 16, cx + R + 16, cy + R + 16], fill=ink)  # hard shadow
+    d.ellipse([cx - R, cy - R, cx + R, cy + R], fill=_hex(SH["white"]), outline=ink, width=6)
+    band = 58
+    if score > 0:
+        d.pieslice([cx - R + 3, cy - R + 3, cx + R - 3, cy + R - 3], start=-90, end=-90 + 360 * score / 100,
+                   fill=_hex(SH["pink"]))
+    r2 = R - band
+    d.ellipse([cx - r2, cy - r2, cx + r2, cy + r2], fill=_hex(SH["white"]), outline=ink, width=6)
+    big = _font("bricolage-800", 170)
     txt = f"{score}%"
-    d.text((cx - d.textlength(txt, font=big) / 2, cy - 130), txt, font=big, fill=_hex(CREAM))
-    fv = _font("fraunces-italic", 64)
-    d.text((W / 2 - d.textlength(verdict, font=fv) / 2, 860), verdict, font=fv, fill=_hex(GOLD))
-    stats = [(str(n_both), "BOTH RATED"), (f"{gap:.1f}", "AVG STAR GAP"), (tougher, "TOUGHER CRITIC")]
-    for i, (v, lab) in enumerate(stats):
-        x = W / 2 + (i - 1) * 300
-        fv2 = _font("fraunces-600", 58 if len(v) < 9 else 40)
-        d.text((x - d.textlength(v, font=fv2) / 2, 990), v, font=fv2, fill=_hex(CREAM))
-        _spaced(d, (x, 1068), lab, _font("bebas-neue", 28), _hex(MUTED), 3)
+    box = big.getbbox(txt)
+    d.text((cx - (box[2] - box[0]) / 2 - box[0], cy - (box[3] - box[1]) / 2 - box[1]), txt, font=big, fill=ink)
+    fv, verdict = _fit("bricolage-800", 68, verdict)
+    d.text((W / 2 - d.textlength(verdict, font=fv) / 2, 830), verdict, font=fv, fill=ink)
+    stats = [(str(n_both), "BOTH RATED", SH["butter"]), (f"{gap:.1f}★", "STAR GAP", SH["white"]),
+             (tougher, "TOUGHER CRITIC", SH["white"])]
+    for i, (v, lab, col) in enumerate(stats):
+        x = W / 2 + (i - 1) * 310
+        d.rounded_rectangle([x - 140, 950, x + 140, 1110], radius=28, fill=_hex(col), outline=ink, width=5)
+        fv2, v = _fit("bricolage-800", 58 if len(v) < 8 else 38, v)
+        d.text((x - d.textlength(v, font=fv2) / 2, 975), v, font=fv2, fill=ink)
+        fl = _font("bricolage-700", 24)
+        d.text((x - d.textlength(lab, font=fl) / 2, 1062), lab, font=fl, fill=_hex(SH["muted"]))
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=88, optimize=True)
     return buf.getvalue()
@@ -1593,23 +1954,22 @@ def share_button(make_image, filename, text, key, label="Share"):
 
 DETAILS_CSS = """
 <style>
-.tk-meta { font-size: .8rem; margin-top: .45rem; opacity: .8; }
-.tk-stream { font-size: .8rem; font-weight: 600; margin-top: .2rem; }
-.sw-meta { font-size: .78rem; opacity: .85; margin-top: .15rem; }
-.sw-stream { font-size: .78rem; color: var(--gold); font-weight: 600; margin-top: .1rem; }
-.share-btn { display: flex; align-items: center; justify-content: center; gap: .5rem; width: 100%; min-height: 2.9rem;
-  border-radius: 999px; border: 1.5px solid rgba(242,193,78,.6); background: rgba(242,193,78,.08); color: var(--gold);
-  font-family: var(--label); font-size: 1.15rem; letter-spacing: .14em; padding-top: .15rem; cursor: pointer;
-  -webkit-tap-highlight-color: transparent; }
-.share-btn:active { transform: scale(.98); }
-.credits { color: var(--muted); font-size: .72rem; text-align: center; margin-top: 2.2rem; opacity: .8; }
+.tk-meta { font-size: .82rem; font-weight: 600; margin-top: .45rem; opacity: .8; }
+.tk-stream { font-size: .82rem; font-weight: 800; margin-top: .2rem; }
+.sw-meta { font-size: .8rem; font-weight: 500; color: var(--muted); margin-top: .15rem; }
+.sw-stream { font-size: .8rem; font-weight: 800; margin-top: .15rem; color: var(--text); }
+.share-btn { display: flex; align-items: center; justify-content: center; gap: .5rem; width: 100%; min-height: 3rem;
+  border-radius: 16px; border: 2px solid var(--line); background: var(--green); color: #1F1A17; box-shadow: 3px 3px 0 var(--line);
+  font-family: var(--sans); font-size: 1.02rem; font-weight: 800; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.share-btn:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--line); }
+.credits { color: var(--muted); font-size: .74rem; font-weight: 500; text-align: center; margin-top: 2.2rem; }
 .credits a { color: var(--muted) !important; }
-.sw-super { width: 54px; height: 54px; align-self: center; background: rgba(242,193,78,.08); color: var(--gold);
-  box-shadow: inset 0 0 0 2px rgba(242,193,78,.6); }
-.sw-super[disabled] { opacity: .3; cursor: default; }
-.stamp-super { left: 50%; top: 18%; transform: translateX(-50%) rotate(-6deg); color: var(--gold); border-color: var(--gold);
-  white-space: nowrap; font-size: 2rem; }
-.super-tag { color: var(--gold); font-size: .78rem; margin-left: .35rem; }
+.sw-super { width: 56px; height: 56px; align-self: center; background: var(--blue); color: #1F1A17; }
+.sw-super[disabled] { opacity: .35; cursor: default; }
+.stamp-super { left: 50%; top: 16%; transform: translateX(-50%) rotate(-6deg); background: var(--butter); color: #1F1A17;
+  white-space: nowrap; }
+.super-tag { display: inline-block; background: var(--butter); color: #1F1A17; border: 1.5px solid var(--line);
+  border-radius: 999px; padding: 0 .45rem; font-size: .74rem; font-weight: 800; margin-left: .35rem; }
 </style>
 """
 md(DETAILS_CSS)
@@ -1630,13 +1990,27 @@ def _room_store():
     return {"lock": threading.Lock(), "rooms": {}}
 
 
-def get_room(code):
+def get_room(code, kind=None):
+    """The live room for a code, or None if it doesn't exist, has expired, or is a different kind."""
     if not code:
         return None
     room = _room_store()["rooms"].get(str(code).strip().upper())
-    if room and time.time() - room["created"] > ROOM_TTL:
+    if not room or time.time() - room["created"] > ROOM_TTL or (kind and room.get("kind") != kind):
         return None
+    room["seen"] = time.time()
     return room
+
+
+def delete_room(code):
+    with _room_store()["lock"]:
+        _room_store()["rooms"].pop(str(code or "").strip().upper(), None)
+
+
+def room_snapshot(code, kind=None):
+    """A private copy taken under the lock, so drawing the page never trips over someone else's change."""
+    with _room_store()["lock"]:
+        room = get_room(code, kind)
+        return copy.deepcopy(room) if room else None
 
 
 def _new_code(store) -> str:
@@ -1644,9 +2018,10 @@ def _new_code(store) -> str:
     now = time.time()
     for c in [c for c, r in store["rooms"].items() if now - r["created"] > ROOM_TTL]:
         del store["rooms"][c]
-    # Hard cap: if there are ever more than MAX_ROOMS live, drop the oldest
-    for c in sorted(store["rooms"], key=lambda c: store["rooms"][c]["created"])[:-MAX_ROOMS or None]:
-        del store["rooms"][c]
+    # Hard cap: if there are ever more than MAX_ROOMS live, drop the ones idle the longest
+    rooms = store["rooms"]
+    for c in sorted(rooms, key=lambda c: rooms[c].get("seen", rooms[c]["created"]))[:-MAX_ROOMS or None]:
+        del rooms[c]
     code = "".join(random.choices(CODE_LETTERS, k=4))
     while code in store["rooms"]:
         code = "".join(random.choices(CODE_LETTERS, k=4))
@@ -1669,7 +2044,7 @@ def create_room(names, deck) -> str:
 def cast_vote(code, seat, key, like):
     store = _room_store()
     with store["lock"]:
-        room = get_room(code)
+        room = get_room(code, "swipe")
         if not room or seat not in room["votes"] or room["match"]:
             return
         if key not in {c["key"] for c in room["deck"]}:
@@ -1679,12 +2054,13 @@ def cast_vote(code, seat, key, like):
             room["match"] = key
 
 
-def new_round(code, keys=None):
-    """Start again, either with a subset of the deck (the 'maybe' pile) or the whole thing."""
+def new_round(code, keys=None, expect_round=None):
+    """Start again, either with a subset of the deck (the 'maybe' pile) or the whole thing.
+    expect_round stops a tap from a screen that's already out of date from resetting a newer round."""
     store = _room_store()
     with store["lock"]:
-        room = get_room(code)
-        if not room:
+        room = get_room(code, "swipe")
+        if not room or (expect_round is not None and room["round"] != expect_round):
             return
         pool_ = room["full_deck"]
         room["deck"] = [c for c in pool_ if c["key"] in keys] if keys else list(pool_)
@@ -1693,11 +2069,11 @@ def new_round(code, keys=None):
         room["round"] += 1
 
 
-def keep_swiping(code):
+def keep_swiping(code, expect_match=None):
     store = _room_store()
     with store["lock"]:
-        room = get_room(code)
-        if room and room["match"]:
+        room = get_room(code, "swipe")
+        if room and room["match"] and (expect_match is None or room["match"] == expect_match):
             room["passed"].add(room["match"])
             room["match"] = None
 
@@ -1778,8 +2154,8 @@ def swipe_card(c, cls: str) -> str:
         meta = f'<div class="sw-title">{esc(c["name"])}</div>' + meta
     strm = f'<div class="sw-stream">{esc(c["stream"])}</div>' if c.get("stream") else ""
     return (f'<div class="sw-card {cls}" data-key="{esc(c["key"])}">{art}'
-            f'<div class="stamp stamp-yes">Watch</div><div class="stamp stamp-no">Pass</div>'
-            f'<div class="stamp stamp-super">Must watch</div>'
+            f'<div class="stamp stamp-yes">YES!</div><div class="stamp stamp-no">NOPE</div>'
+            f'<div class="stamp stamp-super">MUST WATCH</div>'
             f'<div class="sw-info"><div><div><b>{esc(str(c["year"] or ""))}</b> · {esc(c["why"])}</div>{meta}{strm}</div>'
             f'{lb}</div></div>')
 
@@ -1793,21 +2169,22 @@ def on_swipe(code, seat):
 def choose_seat(code, name):
     st.session_state[f"seat_{code}"] = name
     with _room_store()["lock"]:
-        room = get_room(code)
+        room = get_room(code, "swipe")
         if room:
             room["joined"].add(name)
 
 
 def leave_room():
-    st.session_state.pop("room", None)
+    code = st.session_state.pop("room", None)
+    st.session_state.pop(f"seat_{code}", None)
     st.query_params.pop("room", None)
 
 
 @st.fragment(run_every=2)
 def room_pulse(code, seat, seen):
-    room = get_room(code)
+    room = get_room(code, "swipe")
     if not room:
-        return
+        st.rerun(scope="app")
     if room_state(room, seat) != seen:
         st.rerun(scope="app")
     other = next(n for n in room["names"] if n != seat)
@@ -1818,19 +2195,19 @@ def room_pulse(code, seat, seen):
         status = "has finished swiping"
     else:
         status = f"is swiping · {n} of {total}"
-    md(f'<div class="sw-status"><span class="live"></span><b style="color:{COLOURS.get(other, SEA)}">'
+    md(f'<div class="sw-status"><span class="live"></span><b>'
        f'{esc(other)}</b> {status}</div>')
 
 
 def swipe_view(code, host=False):
-    room = get_room(code)
+    room = room_snapshot(code, "swipe")
     if not room:
         note("<b>That swipe session has ended.</b> Sessions last up to 12 hours. "
              "Start a new one from the Swipe tab.")
         st.button("OK", on_click=leave_room)
         return
     names = room["names"]
-    COLOURS.update({names[0]: GOLD, names[1]: SEA})
+    COLOURS.update({names[0]: "var(--pa)", names[1]: "var(--pb)"})
     seat = st.session_state.get(f"seat_{code}")
     prefetch_posters([(c["key"], c["name"], c["year"]) for c in room["deck"]])
 
@@ -1847,8 +2224,10 @@ def swipe_view(code, host=False):
         cols = st.columns(2)
         for col, n in zip(cols, names):
             taken = n in room["joined"]
-            col.button(f"I'm {n}" + (" (joined)" if taken else ""), key=f"seat_btn_{n}", width="stretch",
-                       on_click=choose_seat, args=(code, n))
+            col.button(f"I'm {n}" + (" (rejoin)" if taken else ""), key=f"seat_btn_{n}", width="stretch",
+                       type="secondary" if taken else "primary", on_click=choose_seat, args=(code, n))
+        if room["joined"]:
+            st.caption("Already joined on another phone? Only rejoin if this is that person's phone.")
         return
 
     other = next(n for n in names if n != seat)
@@ -1858,9 +2237,9 @@ def swipe_view(code, host=False):
 
     if match:
         c = next(c for c in room["deck"] if c["key"] == match)
-        md(f'<div class="its-match"><div class="im-k">✦ It\'s a match ✦</div>'
-           f'<div class="im-t">{esc(names[0])} <em>&amp;</em> {esc(names[1])}</div>'
-           f'<div class="im-n">You both swiped right. Tonight\'s film is…</div></div>')
+        md(f'<div class="its-match"><div class="im-k">YES! YES!</div>'
+           f'<div class="im-t">It\'s a <em>match!</em></div>'
+           f'<div class="im-n">{esc(names[0])} and {esc(names[1])} both swiped right. Tonight\'s film is…</div></div>')
         why = esc(c["why"]) + "".join(f'<div class="{cls}">{esc(c[f])}</div>'
                                       for f, cls in (("meta", "tk-meta"), ("stream", "tk-stream")) if c.get(f))
         md(ticket(c["key"], c["name"], c["year"], c["uri"], why, kicker="Matched for tonight"))
@@ -1868,7 +2247,7 @@ def swipe_view(code, host=False):
                                     c.get("meta", ""), c.get("stream", ""), real_poster_url(c["key"], "xl")),
                      "double-feature-match.jpg", f"It's a match: {c['name']} 🎬", key=f"share_match_{code}",
                      label="Share the match")
-        st.button("Keep swiping for another", width="stretch", on_click=keep_swiping, args=(code,))
+        st.button("Keep swiping for another", width="stretch", on_click=keep_swiping, args=(code, match))
         return
 
     deck = [c for c in room["deck"] if c["key"] not in room["passed"]]
@@ -1892,7 +2271,9 @@ def swipe_view(code, host=False):
              f"If you both like the same film, it'll pop up here.")
         return
     maybes = [c["key"] for c in deck if mine.get(c["key"]) or theirs.get(c["key"])]
-    if not maybes:
+    if not maybes and room["passed"]:
+        msg = "That's the whole deck, and you've already seen every match in it."
+    elif not maybes:
         msg = "You passed on everything. Tough crowd."
     elif len(maybes) < len(deck):
         msg = f"{len(maybes)} films got a yes from one of you. Swipe on just those to settle it?"
@@ -1900,77 +2281,81 @@ def swipe_view(code, host=False):
         msg = "Every film got a yes from one of you, just never both at once. Go again?"
     note(f"<b>No match this round.</b> {msg}")
     if maybes and len(maybes) < len(deck):
-        st.button("Swipe the maybes", type="primary", width="stretch", on_click=new_round, args=(code, maybes))
-    st.button("Start over with the whole deck", width="stretch", on_click=new_round, args=(code,))
+        st.button("Swipe the maybes", type="primary", width="stretch", on_click=new_round,
+                  args=(code, maybes, room["round"]))
+    st.button("Start over with the whole deck", width="stretch", on_click=new_round, args=(code, None, room["round"]))
 
 
 SWIPE_CSS = """
 <style>
-.room { text-align: center; border-radius: 18px; padding: 1rem 1rem .9rem; margin: .4rem 0 .5rem;
-  background: linear-gradient(160deg, rgba(242,193,78,.14), rgba(142,197,192,.08));
-  box-shadow: inset 0 0 0 1px rgba(242,193,78,.3); }
-.room-k { font-family: var(--label); letter-spacing: .26em; font-size: .85rem; color: var(--gold); }
-.room-code { font-family: var(--label); font-size: 3.6rem; letter-spacing: .3em; line-height: 1; padding: .3rem 0 .2rem .3em;
-  color: var(--cream); text-shadow: 0 0 24px rgba(242,193,78,.35); }
-.room-n { color: var(--muted); font-size: .88rem; line-height: 1.45; }
-.sw-head { display: flex; justify-content: space-between; align-items: center; font-size: .88rem; color: var(--muted);
-  margin: .5rem 0 .45rem; }
-.sw-head b { color: var(--cream); font-weight: 600; }
-.sw-head span:last-child { font-family: var(--label); letter-spacing: .14em; font-size: .95rem; }
-.sw-prog { height: 3px; border-radius: 3px; background: rgba(243,236,221,.08); overflow: hidden; margin-bottom: .9rem; }
-.sw-prog i { display: block; height: 100%; background: linear-gradient(90deg, var(--gold), var(--sea)); }
-.sw-stack { position: relative; height: min(450px, calc(100svh - 250px), 120vw); aspect-ratio: 2 / 3; margin: 0 auto; }
-.sw-card { position: absolute; inset: 0; border-radius: 18px; overflow: hidden; touch-action: pan-y; user-select: none;
-  -webkit-user-select: none; cursor: grab; will-change: transform;
-  box-shadow: 0 24px 50px -20px rgba(0,0,0,.9), 0 0 0 1px rgba(255,255,255,.06); }
+.room { text-align: center; border-radius: 22px; padding: 1.1rem 1rem 1rem; margin: .4rem 0 .6rem;
+  background: var(--surface); border: 2px solid var(--line); box-shadow: 4px 4px 0 var(--line); }
+.room-k { font-weight: 700; letter-spacing: .14em; font-size: .75rem; color: var(--muted); text-transform: uppercase; }
+.room-code { display: inline-block; margin: .55rem 0 .5rem; padding: .35rem .7rem .3rem .95rem; border-radius: 16px;
+  background: var(--butter); color: #1F1A17; border: 2px solid var(--line); font-size: 2.6rem; font-weight: 800;
+  letter-spacing: .28em; line-height: 1.1; }
+.room-n { color: var(--muted); font-size: .9rem; font-weight: 500; line-height: 1.45; }
+.sw-head { display: flex; justify-content: space-between; align-items: center; font-size: .9rem; font-weight: 600;
+  color: var(--muted); margin: .5rem 0 .5rem; }
+.sw-head b { color: var(--text); font-weight: 800; }
+.sw-head span:last-child { font-weight: 800; color: var(--text); }
+.sw-prog { height: 10px; border-radius: 6px; background: var(--surface); border: 2px solid var(--line); overflow: hidden;
+  margin-bottom: 1rem; }
+.sw-prog i { display: block; height: 100%; background: var(--pink); }
+.sw-stack { position: relative; height: min(460px, calc(100svh - 250px), 122vw); aspect-ratio: 2 / 3; margin: 0 auto; }
+.sw-card { position: absolute; inset: 0; border-radius: 24px; overflow: hidden; touch-action: pan-y; user-select: none;
+  -webkit-user-select: none; cursor: grab; will-change: transform; background: var(--surface);
+  border: 2px solid var(--line); box-shadow: 5px 5px 0 var(--line); }
 .sw-card.top { z-index: 2; animation: sw-in .3s ease-out both; }
-.sw-card.next { z-index: 1; transform: translateY(12px) scale(.94); filter: brightness(.55); pointer-events: none; }
+.sw-card.next { z-index: 1; transform: rotate(5deg) translate(10px, 6px); pointer-events: none; }
 @keyframes sw-in { from { transform: scale(.96); } }
-.sw-card .poster { position: absolute; inset: 0; width: 100%; height: 100%; aspect-ratio: auto; border-radius: 0; }
-.p-xl .p-t { font-size: 2.05rem; -webkit-line-clamp: 5; padding: 11% 10% 0; line-height: 1.02; }
+.sw-card .poster { position: absolute; inset: 0; width: 100%; height: 100%; aspect-ratio: auto; border-radius: 0;
+  border: 0; box-shadow: none; }
+.p-xl .p-t { font-size: 2.1rem; -webkit-line-clamp: 5; padding: 11% 10% 0; line-height: 1; }
 .p-xl .p-y { display: none; }
-.sw-info { position: absolute; left: 0; right: 0; bottom: 0; padding: 3.2rem 1.1rem 1rem; z-index: 3;
+.sw-info { position: absolute; left: 0; right: 0; bottom: 0; padding: .8rem 1rem .9rem; z-index: 3;
   display: flex; justify-content: space-between; align-items: flex-end; gap: .6rem;
-  background: linear-gradient(180deg, rgba(10,14,22,0), rgba(10,14,22,.88)); font-size: .86rem; color: var(--cream); }
-.sw-info b { font-family: var(--label); letter-spacing: .12em; font-weight: 400; font-size: 1rem; }
-.sw-lb { flex: 0 0 auto; font-family: var(--label); letter-spacing: .12em; font-size: .85rem; color: var(--gold) !important;
-  text-decoration: none !important; padding: .3rem .6rem .15rem; border-radius: 999px; background: rgba(17,25,38,.7); }
-.stamp { position: absolute; top: 42%; z-index: 4; font-family: var(--label); font-size: 2.3rem; letter-spacing: .14em;
-  padding: .25rem .7rem 0; border: 4px solid; border-radius: 10px; opacity: 0; pointer-events: none;
-  background: rgba(17,25,38,.35); }
-.stamp-yes { left: 1rem; color: var(--sea); border-color: var(--sea); transform: rotate(-14deg); }
-.stamp-no { right: 1rem; color: var(--coral); border-color: var(--coral); transform: rotate(14deg); }
-.sw-btns { display: flex; justify-content: center; gap: 2rem; margin: 1.3rem 0 .4rem; }
-.sw-btn { width: 66px; height: 66px; border-radius: 50%; border: 0; display: grid; place-items: center; cursor: pointer;
-  transition: transform .15s; -webkit-tap-highlight-color: transparent; }
-.sw-btn:active { transform: scale(.9); }
-.sw-no { background: rgba(238,138,109,.1); color: var(--coral); box-shadow: inset 0 0 0 2px rgba(238,138,109,.55); }
-.sw-yes { background: linear-gradient(180deg, #F7D06E, var(--gold) 55%, var(--gold-deep)); color: var(--ink);
-  box-shadow: 0 10px 26px -8px rgba(242,193,78,.7); }
-.sw-hint { text-align: center; color: var(--muted); font-size: .8rem; margin-bottom: .6rem; }
-.sw-status { display: flex; align-items: center; justify-content: center; gap: .1rem; font-size: .85rem;
-  color: var(--muted); padding: .45rem .8rem; border-radius: 999px; background: rgba(27,37,54,.75);
-  box-shadow: inset 0 0 0 1px var(--line); width: fit-content; margin: .3rem auto .6rem; }
-.sw-status b { color: var(--cream); font-weight: 600; margin-right: .3rem; }
-.live { width: .45rem; height: .45rem; border-radius: 50%; background: #6FD08C; margin-right: .5rem;
-  box-shadow: 0 0 0 0 rgba(111,208,140,.6); animation: live 1.8s infinite; }
-@keyframes live { 70% { box-shadow: 0 0 0 7px rgba(111,208,140,0); } 100% { box-shadow: 0 0 0 0 rgba(111,208,140,0); } }
-.its-match { text-align: center; margin: .6rem 0 1rem; animation: pop .6s cubic-bezier(.2,.9,.25,1.3) both; }
+  background: var(--surface); border-top: 2px solid var(--line); font-size: .86rem; font-weight: 500; color: var(--text); }
+.sw-info b { font-weight: 800; }
+.sw-lb { flex: 0 0 auto; font-weight: 800; font-size: .8rem; color: var(--text) !important;
+  text-decoration: none !important; padding: .3rem .65rem; border-radius: 999px; border: 2px solid var(--line); }
+.stamp { position: absolute; top: 34%; z-index: 4; font-family: var(--sans); font-size: 2rem; font-weight: 800;
+  padding: .1rem .8rem; border: 2px solid var(--line); border-radius: 14px; opacity: 0; pointer-events: none;
+  color: #1F1A17; letter-spacing: -.01em; }
+.stamp-yes { left: 1rem; background: var(--green); transform: rotate(-12deg); }
+.stamp-no { right: 1rem; background: var(--surface); color: var(--text); transform: rotate(12deg); }
+.sw-btns { display: flex; justify-content: center; align-items: center; gap: 1.3rem; margin: 1.4rem 0 .5rem; }
+.sw-btn { width: 68px; height: 68px; border-radius: 50%; border: 2px solid var(--line); display: grid; place-items: center;
+  cursor: pointer; box-shadow: 3px 3px 0 var(--line); transition: transform .15s; -webkit-tap-highlight-color: transparent; }
+.sw-btn:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--line); }
+.sw-no { background: var(--surface); color: var(--text); }
+.sw-yes { background: var(--pink); color: #1F1A17; }
+.sw-hint { text-align: center; color: var(--muted); font-size: .82rem; font-weight: 500; margin-bottom: .6rem; }
+.sw-status { display: flex; align-items: center; justify-content: center; gap: .1rem; font-size: .88rem; font-weight: 600;
+  color: var(--muted); padding: .45rem .9rem; border-radius: 999px; background: var(--surface);
+  border: 2px solid var(--line); width: fit-content; margin: .3rem auto .7rem; }
+.sw-status b { color: var(--text); font-weight: 800; margin-right: .3rem; }
+.live { width: .5rem; height: .5rem; border-radius: 50%; background: #4FAE7C; margin-right: .5rem;
+  box-shadow: 0 0 0 0 rgba(79,174,124,.6); animation: live 1.8s infinite; }
+@keyframes live { 70% { box-shadow: 0 0 0 7px rgba(79,174,124,0); } 100% { box-shadow: 0 0 0 0 rgba(79,174,124,0); } }
+.its-match { text-align: center; margin: .6rem 0 1.1rem; animation: pop .6s cubic-bezier(.2,.9,.25,1.3) both; }
 @keyframes pop { from { opacity: 0; transform: scale(.85); } }
-.im-k { font-family: var(--label); letter-spacing: .3em; color: var(--gold); font-size: 1rem; }
-.im-t { font-family: var(--display); font-size: 2.3rem; font-weight: 600; line-height: 1.05; margin: .25rem 0 .3rem;
-  text-shadow: 0 0 30px rgba(242,193,78,.35); }
-.im-t em { color: var(--gold); font-weight: 400; }
-.im-n { color: var(--muted); font-size: .92rem; }
+.im-k { display: inline-block; background: var(--green); color: #1F1A17; border: 2px solid var(--line); border-radius: 12px;
+  padding: .1rem .8rem; font-weight: 800; font-size: 1rem; transform: rotate(-4deg); }
+.im-t { font-size: 2.7rem; font-weight: 800; line-height: .95; letter-spacing: -.045em; margin: .55rem 0 .35rem; }
+.im-t em { font-style: normal; color: var(--accent-ink); }
+.im-n { color: var(--muted); font-size: .95rem; font-weight: 500; }
 .or { display: flex; align-items: center; gap: .8rem; margin: 1.4rem 0 .2rem; color: var(--muted);
-  font-family: var(--label); letter-spacing: .2em; font-size: .9rem; }
-.or:before, .or:after { content: ""; flex: 1; height: 1px; background: var(--line); }
-.how-n { color: var(--muted); font-size: .8rem; margin: -.3rem 0 .2rem; }
-.how { display: grid; gap: 8px; margin: .8rem 0 1.1rem; }
-.how div { display: flex; gap: .8rem; align-items: center; border-radius: 14px; padding: .75rem .9rem;
-  background: rgba(27,37,54,.75); box-shadow: inset 0 0 0 1px var(--line); font-size: .9rem; line-height: 1.4; }
-.how > div > b { flex: 0 0 1.9rem; height: 1.9rem; border-radius: 50%; display: grid; place-items: center; font-family: var(--label);
-  font-size: 1.05rem; font-weight: 400; background: rgba(242,193,78,.15); color: var(--gold); padding-top: .1rem; }
+  font-weight: 700; letter-spacing: .14em; font-size: .78rem; text-transform: uppercase; }
+.or:before, .or:after { content: ""; flex: 1; height: 2px; background: var(--line); opacity: .25; }
+.how-n { color: var(--muted); font-size: .82rem; margin: -.3rem 0 .2rem; }
+.how { display: grid; gap: 10px; margin: .9rem 0 1.2rem; }
+.how div { display: flex; gap: .8rem; align-items: center; border-radius: 18px; padding: .8rem .9rem;
+  background: var(--surface); border: 2px solid var(--line); font-size: .93rem; font-weight: 600; line-height: 1.35; }
+.how > div > b { flex: 0 0 2rem; height: 2rem; border-radius: 50%; display: grid; place-items: center; font-weight: 800;
+  font-size: 1rem; background: var(--butter); color: #1F1A17; border: 2px solid var(--line); box-sizing: border-box; }
+.how > div:nth-child(2) > b { background: var(--pink); } .how > div:nth-child(3) > b { background: var(--blue); }
+.how > div:nth-child(4) > b { background: var(--green); }
 @media (prefers-reduced-motion: reduce) { .sw-card.top, .its-match, .live { animation: none !important; } }
 </style>
 """
@@ -1985,6 +2370,20 @@ KEEP = {  # the only parts of an export the app ever reads
     "watchlist.csv": ["Name", "Year", "Letterboxd URI"],
     "profile.csv": ["Username", "Given Name"],
 }
+
+
+def safe_load(raw):
+    """Parse a slimmed upload; None if it can't be read for any reason."""
+    try:
+        return load_export(raw) if raw else None
+    except (zipfile.BadZipFile, ValueError, TypeError, KeyError, UnicodeDecodeError, RuntimeError, OSError):
+        return None
+
+
+def clean_name(name) -> str:
+    """Names are shown to other people, so keep them short and free of markdown or HTML."""
+    name = re.sub(r"[\[\]()<>*_`#|~\\{}!$^:/]", "", str(name or ""))
+    return " ".join(name.split())[:24]
 
 
 def bundle(files):
@@ -2005,22 +2404,23 @@ def bundle(files):
                     src[name] = z.read(path)
         else:
             for f in files:
-                name = f.name.rsplit("/", 1)[-1].lower()
+                name = _csv_name(f.name)
                 if name in KEEP:
                     src[name] = f.getvalue()
-    except zipfile.BadZipFile:
+    except (zipfile.BadZipFile, OSError, RuntimeError, ValueError):  # not a zip, damaged, or password-protected
         return None
     if not src:
         return None
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as out:
         for name, data in src.items():
-            try:
-                df = pd.read_csv(io.BytesIO(data), dtype=str)
-            except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError):
-                continue
+            df = _read_csv(data)
             df = df[[c for c in KEEP[name] if c in df.columns]]
-            out.writestr(name, df.to_csv(index=False))
+            if df.shape[1] == 0:
+                continue
+            # a fixed timestamp keeps the bytes identical on every rerun, so the parsed export stays cached
+            out.writestr(zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)), df.to_csv(index=False),
+                         compress_type=zipfile.ZIP_DEFLATED)
     return buf.getvalue()
 
 
@@ -2045,14 +2445,11 @@ def pair_state(room):
 def read_upload(files, typed_name: str, fallback: str):
     """Validate one person's upload. Returns (raw, name) or (None, error message)."""
     raw = bundle(files)
-    try:
-        d = load_export(raw) if raw else None
-    except (zipfile.BadZipFile, TypeError, pd.errors.ParserError):
-        d = None
+    d = safe_load(raw)
     if not d or not d["found"]:
         return None, ("That doesn't look like a Letterboxd export. Upload the .zip from letterboxd.com → "
                       "Settings → Data → Export your data, or the watched.csv, ratings.csv and watchlist.csv inside it.")
-    return raw, (typed_name.strip() or d["name"] or fallback)
+    return raw, (clean_name(typed_name) or d["name"] or fallback)
 
 
 def start_pair():
@@ -2063,6 +2460,7 @@ def start_pair():
     st.session_state.sp_error = ""
     st.session_state.pair = create_pair(name, raw)
     st.session_state.me = 0
+    st.query_params["room"] = st.session_state.pair  # a reload brings this phone back to its pair
 
 
 def finish_pair(code):
@@ -2072,8 +2470,11 @@ def finish_pair(code):
         return
     store = _room_store()
     with store["lock"]:
-        room = get_room(code)
-        if not room or room["slots"][1] is not None:
+        room = get_room(code, "pair")
+        if not room:
+            st.session_state.pj_error = "That pair code has expired. Ask for a new one."
+            return
+        if room["slots"][1] is not None:
             st.session_state.pj_error = "Someone has already paired with this code."
             return
         if name.casefold() == room["slots"][0]["name"].casefold():
@@ -2082,15 +2483,31 @@ def finish_pair(code):
     st.session_state.pj_error = ""
     st.session_state.pair, st.session_state.me = code, 1
     st.session_state.pop("pair_join", None)
+    st.query_params["room"] = code
 
 
 def rejoin_pair(code, i):
+    with _room_store()["lock"]:
+        room = get_room(code, "pair")
+        if room:
+            room.get("left", set()).discard(i)
     st.session_state.pair, st.session_state.me = code, i
     st.session_state.pop("pair_join", None)
+    st.query_params["room"] = code
 
 
 def unpair():
-    for k in ("pair", "me", "pair_join", "seen_swipe", "room"):
+    """Leave the pair on this phone. Once nobody is using it (or it was never completed), the room
+    and both exports are deleted straight away rather than waiting 12 hours."""
+    code, me_ = st.session_state.get("pair"), st.session_state.get("me")
+    if code is not None and me_ is not None:
+        with _room_store()["lock"]:
+            room = get_room(code, "pair")
+            if room:
+                room.setdefault("left", set()).add(me_)
+                if room["slots"][1] is None or len(room["left"]) >= 2:
+                    _room_store()["rooms"].pop(code, None)
+    for k in ("pair", "me", "pair_join", "seen_swipe", "room", "qp_handled"):
         st.session_state.pop(k, None)
     st.query_params.pop("room", None)
 
@@ -2118,7 +2535,7 @@ def start_pair_swipe(pair_code, names, deck, seat):
     sc = create_room(names, deck)
     store = _room_store()
     with store["lock"]:
-        room = get_room(pair_code)
+        room = get_room(pair_code, "pair")
         if room:
             room["swipe"] = sc
     st.session_state.seen_swipe = sc
@@ -2127,14 +2544,15 @@ def start_pair_swipe(pair_code, names, deck, seat):
 
 def end_pair_swipe(pair_code):
     with _room_store()["lock"]:
-        room = get_room(pair_code)
+        room = get_room(pair_code, "pair")
         if room:
+            _room_store()["rooms"].pop(room["swipe"] or "", None)
             room["swipe"] = None
 
 
 @st.fragment(run_every=2)
 def pair_pulse(code, seen):
-    room = get_room(code)
+    room = get_room(code, "pair")
     if not room or pair_state(room) != seen:
         st.rerun(scope="app")
 
@@ -2198,37 +2616,36 @@ def export_guide(group=False, expanded=False):
 
 GUIDE_CSS = """
 <style>
-.guide { display: grid; gap: 10px; margin-top: .7rem; }
-.gstep { display: grid; grid-template-columns: 118px 1fr; gap: .8rem; align-items: center; padding: .65rem;
-  border-radius: 14px; background: rgba(17,25,38,.6); box-shadow: inset 0 0 0 1px var(--line); }
-.gtext { font-size: .86rem; line-height: 1.45; color: var(--muted); }
-.gtext b { color: var(--cream); font-weight: 600; }
-.gtext em { display: inline-grid; place-items: center; width: 1.35rem; height: 1.35rem; border-radius: 50%; font-style: normal;
-  background: rgba(242,193,78,.15); color: var(--gold); font-family: var(--label); font-size: .9rem; margin-right: .4rem;
-  padding-top: .1rem; vertical-align: .05rem; }
-.gmock { border-radius: 12px; background: #e9e6df; padding: .45rem .45rem .5rem; color: #2a2f38; font-size: .56rem;
-  line-height: 1.2; box-shadow: 0 0 0 3px #2a3448, 0 8px 18px -8px rgba(0,0,0,.8); min-height: 92px;
+.guide { display: grid; gap: 10px; margin-top: .8rem; }
+.gstep { display: grid; grid-template-columns: 118px 1fr; gap: .8rem; align-items: center; padding: .7rem;
+  border-radius: 18px; background: var(--surface); border: 2px solid var(--line); }
+.gtext { font-size: .88rem; font-weight: 500; line-height: 1.4; color: var(--muted); }
+.gtext b { color: var(--text); font-weight: 800; }
+.gtext em { display: inline-grid; place-items: center; width: 1.45rem; height: 1.45rem; border-radius: 50%; font-style: normal;
+  background: var(--butter); color: #1F1A17; border: 2px solid var(--line); box-sizing: border-box; font-weight: 800;
+  font-size: .8rem; margin-right: .4rem; vertical-align: .05rem; }
+.gmock { border-radius: 12px; background: #F4F2EE; padding: .45rem .45rem .5rem; color: #2a2f38; font-size: .56rem;
+  line-height: 1.2; border: 2px solid #1F1A17; min-height: 92px;
   display: flex; flex-direction: column; gap: .28rem; overflow: hidden; }
 .gm-url { display: flex; gap: .2rem; align-items: center; background: #fff; border-radius: 6px; padding: .2rem .3rem;
   font-size: .5rem; color: #555; white-space: nowrap; overflow: hidden; }
-.gm-top { font-weight: 700; font-size: .66rem; }
-.gm-in { background: #fff; border-radius: 4px; padding: .2rem .3rem; color: #999; border: 1px solid #d5d1c8; }
-.gm-row { height: .5rem; border-radius: 3px; background: #c9c3b6; width: 85%; }
+.gm-top { font-weight: 800; font-size: .66rem; }
+.gm-in { background: #fff; border-radius: 4px; padding: .2rem .3rem; color: #888; border: 1px solid #d5d1c8; }
+.gm-row { height: .5rem; border-radius: 3px; background: #d6d1c8; width: 85%; }
 .gm-row.s { width: 60%; }
-.gm-save { align-self: flex-start; background: #2a3448; color: #fff; border-radius: 4px; padding: .18rem .45rem;
-  font-weight: 700; }
+.gm-save { align-self: flex-start; background: #1F1A17; color: #fff; border-radius: 4px; padding: .18rem .45rem; font-weight: 700; }
 .gm-tabs { display: flex; gap: .35rem; border-bottom: 1px solid #cfc9bd; padding-bottom: .2rem; color: #888; }
-.gm-tabs .on { color: #2a2f38; font-weight: 700; box-shadow: 0 .25rem 0 -.08rem var(--gold-deep); }
-.gm-btn { position: relative; align-self: center; margin-top: .35rem; background: #2a3448; color: #fff; border-radius: 6px;
+.gm-tabs .on { color: #1F1A17; font-weight: 800; box-shadow: 0 .25rem 0 -.08rem #F49AB8; }
+.gm-btn { position: relative; align-self: center; margin-top: .35rem; background: #1F1A17; color: #fff; border-radius: 6px;
   padding: .35rem .5rem; font-weight: 700; white-space: nowrap; }
 .gm-btn i { position: absolute; right: -.35rem; bottom: -.4rem; width: 1rem; height: 1rem; border-radius: 50%;
-  background: rgba(242,193,78,.55); box-shadow: 0 0 0 0 rgba(242,193,78,.7); animation: tapping 1.6s infinite; }
-@keyframes tapping { 70% { box-shadow: 0 0 0 .55rem rgba(242,193,78,0); } 100% { box-shadow: 0 0 0 0 rgba(242,193,78,0); } }
+  background: rgba(244,154,184,.75); box-shadow: 0 0 0 0 rgba(244,154,184,.8); animation: tapping 1.6s infinite; }
+@keyframes tapping { 70% { box-shadow: 0 0 0 .55rem rgba(244,154,184,0); } 100% { box-shadow: 0 0 0 0 rgba(244,154,184,0); } }
 .gm-file { display: flex; gap: .35rem; align-items: center; background: #fff; border-radius: 8px; padding: .35rem;
-  margin-top: .3rem; }
-.gm-file b { display: block; font-size: .55rem; } .gm-file small { color: #3a8a5a; font-weight: 600; }
-.gm-zip { background: var(--gold); color: #2a2f38; border-radius: 4px; padding: .3rem .25rem; font-weight: 800; font-size: .5rem; }
-.gm-arrow { text-align: center; color: #b07a12; font-weight: 700; margin-top: .15rem; }
+  margin-top: .3rem; border: 1px solid #d5d1c8; }
+.gm-file b { display: block; font-size: .55rem; } .gm-file small { color: #2E7D55; font-weight: 700; }
+.gm-zip { background: #F6D776; color: #1F1A17; border-radius: 4px; padding: .3rem .25rem; font-weight: 800; font-size: .5rem; }
+.gm-arrow { text-align: center; color: #B8336A; font-weight: 800; margin-top: .15rem; }
 @media (prefers-reduced-motion: reduce) { .gm-btn i { animation: none; } }
 </style>
 """
@@ -2279,8 +2696,7 @@ def film_entry(name, year=None, uri=None):
     name = str(name).strip()
     year = _norm_year(year)
     key = f"{title_key(name) or name.casefold()}|{year if year is not None else '<NA>'}"
-    if not uri or (isinstance(uri, float) and pd.isna(uri)):
-        uri = f"https://letterboxd.com/search/films/{urllib.parse.quote(name)}/"
+    uri = safe_uri(uri) or f"https://letterboxd.com/search/films/{urllib.parse.quote(name)}/"
     return {"key": key, "name": name, "year": str(year or ""), "uri": str(uri)}
 
 
@@ -2337,14 +2753,14 @@ def create_group(host_name) -> tuple:
 
 
 def group_state(room):
-    """Changes here reload every phone in the group (phase changes and new rounds)."""
-    return (room["phase"], room["round"])
+    """Changes here reload every phone in the group (phase changes, new rounds, a new host)."""
+    return (room["phase"], room["round"], room["host"])
 
 
 def add_member(code, name):
     store = _room_store()
     with store["lock"]:
-        room = get_room(code)
+        room = get_room(code, "group")
         if not room or len(room["members"]) >= GROUP_MAX_PEOPLE:
             return None
         taken = {m["name"].casefold() for m in room["members"].values()}
@@ -2358,12 +2774,13 @@ def add_member(code, name):
         return mid
 
 
-def set_films(code, mid, films):
+def set_films(code, mid, films) -> bool:
+    """Put this person's films in the pot. False if that's no longer possible (voting has started)."""
     store = _room_store()
     with store["lock"]:
-        room = get_room(code)
+        room = get_room(code, "group")
         if not room or mid not in room["members"] or room["phase"] != "lobby":
-            return
+            return False
         me_ = room["members"][mid]
         for f in me_["films"]:  # replace this person's previous picks
             entry = room["films"].get(f)
@@ -2387,13 +2804,15 @@ def set_films(code, mid, films):
             if mid not in entry["by"]:
                 entry["by"].append(mid)
                 me_["films"].append(f["key"])
+        return True
 
 
-def start_group_vote(code, keys=None):
+def start_group_vote(code, keys=None, expect_round=None):
     store = _room_store()
     with store["lock"]:
-        room = get_room(code)
-        if not room:
+        room = get_room(code, "group")
+        # only from the lobby or the results, and only once (a double tap would wipe everyone's votes)
+        if not room or room["phase"] == "voting" or (expect_round is not None and room["round"] != expect_round):
             return
         deck = list(keys) if keys else list(room["films"])
         random.Random(f"{code}{room['round']}").shuffle(deck)
@@ -2405,15 +2824,15 @@ def start_group_vote(code, keys=None):
 
 def end_group_vote(code):
     with _room_store()["lock"]:
-        room = get_room(code)
+        room = get_room(code, "group")
         if room and room["phase"] == "voting":
             room["phase"] = "results"
 
 
 def back_to_lobby(code):
     with _room_store()["lock"]:
-        room = get_room(code)
-        if room:
+        room = get_room(code, "group")
+        if room and room["phase"] != "lobby":
             room["phase"], room["deck"], room["votes"] = "lobby", [], {}
             room["round"] += 1
 
@@ -2423,8 +2842,8 @@ def group_vote(code, mid):
     if not (v and v.get("key")):
         return
     with _room_store()["lock"]:
-        room = get_room(code)
-        if not room or room["phase"] != "voting" or v["key"] not in room["deck"]:
+        room = get_room(code, "group")
+        if not room or room["phase"] != "voting" or v["key"] not in room["deck"] or mid not in room["members"]:
             return
         like = v.get("like")
         if like == "super":
@@ -2434,9 +2853,37 @@ def group_vote(code, mid):
             else:
                 supers[mid] = v["key"]
         room["votes"].setdefault(mid, {})[v["key"]] = like if like == "super" else bool(like)
-        voters = [m for m in room["votes"] if m in room["members"]]
-        if voters and all(len(room["votes"][m]) >= len(room["deck"]) for m in voters):
-            room["phase"] = "results"
+        _close_if_done(room)
+
+
+def _close_if_done(room):
+    """Show the results as soon as everyone still in the group has voted on every film. Call with the lock held."""
+    voters = [m for m in room["members"] if m in room["votes"]]
+    if room["phase"] == "voting" and voters and all(len(room["votes"][m]) >= len(room["deck"]) for m in voters):
+        room["phase"] = "results"
+
+
+def remove_member(code, mid):
+    """Someone left: drop them (and their unvoted films, in the lobby), hand over hosting if needed,
+    and delete the room once nobody's left."""
+    with _room_store()["lock"]:
+        room = get_room(code, "group")
+        if not room or mid not in room["members"]:
+            return
+        gone = room["members"].pop(mid)  # their votes stay: they still count towards the result
+        if room["phase"] == "lobby":
+            for f in gone["films"]:
+                entry = room["films"].get(f)
+                if entry:
+                    entry["by"] = [b for b in entry["by"] if b != mid]
+                    if not entry["by"]:
+                        del room["films"][f]
+        if not room["members"]:
+            _room_store()["rooms"].pop(room["code"], None)
+            return
+        if room["host"] == mid:
+            room["host"] = next(iter(room["members"]))
+        _close_if_done(room)
 
 
 def tally(room):
@@ -2455,19 +2902,22 @@ def tally(room):
 
 
 def leave_group():
-    for k in ("group", "gid", "group_join"):
+    if st.session_state.get("group") and st.session_state.get("gid"):
+        remove_member(st.session_state.group, st.session_state.gid)
+    for k in ("group", "gid", "group_join", "qp_handled"):
         st.session_state.pop(k, None)
     st.query_params.pop("room", None)
 
 
 def host_group():
-    name = st.session_state.get("gh_name", "").strip() or "Host"
+    name = clean_name(st.session_state.get("gh_name", "")) or "Host"
     code, mid = create_group(name)
     st.session_state.group, st.session_state.gid = code, mid
+    st.query_params["room"] = code  # a reload brings this phone back to the group
 
 
 def join_group(code):
-    name = st.session_state.get("gj_name", "").strip()
+    name = clean_name(st.session_state.get("gj_name", ""))
     if not name:
         st.session_state.gj_error = "Add your name so everyone knows who's voting."
         return
@@ -2478,15 +2928,20 @@ def join_group(code):
     st.session_state.gj_error = ""
     st.session_state.group, st.session_state.gid = code, mid
     st.session_state.pop("group_join", None)
+    st.query_params["room"] = code
 
 
 def rejoin_group(code, mid):
     st.session_state.group, st.session_state.gid = code, mid
     st.session_state.pop("group_join", None)
+    st.query_params["room"] = code
 
 
 def save_my_films(code, mid, films):
-    set_films(code, mid, films)
+    if not set_films(code, mid, films):
+        st.session_state.gf_error = "Too late to add films: the vote has already started."
+        return
+    st.session_state.pop("gf_error", None)
     st.session_state.gf_saved = True
 
 
@@ -2497,7 +2952,7 @@ def by_names(room, entry):
 
 @st.fragment(run_every=2)
 def group_pulse(code, mid, seen):
-    room = get_room(code)
+    room = room_snapshot(code, "group")
     if not room or group_state(room) != seen:
         st.rerun(scope="app")
     members = room["members"]
@@ -2565,6 +3020,8 @@ def group_film_picker(code, mid, room):
 
 
 def group_film_form(code, mid):
+    if st.session_state.get("gf_error"):
+        st.error(st.session_state.gf_error)
     films = []
     up = st.file_uploader("Your Letterboxd export", type=["zip", "csv"], key="gf_file", help=GROUP_UPLOAD_HELP)
     if up is not None:
@@ -2589,10 +3046,10 @@ def group_film_form(code, mid):
 
 
 def group_view(code, mid):
-    room = get_room(code)
+    room = room_snapshot(code, "group")
     if not room or mid not in room["members"]:
         with header:
-            marquee("Movie night", "Double <em>Feature</em>", "Group night")
+            marquee("Group night", "Movie night<em>?</em>", "")
         note("<b>That movie night has ended.</b> They last 12 hours. Start a new one from the home screen.")
         st.button("OK", on_click=leave_group)
         return
@@ -2600,8 +3057,7 @@ def group_view(code, mid):
     is_host = mid == room["host"]
     host = room["members"][room["host"]]["name"]
     with header:
-        marquee("Movie night", f"{esc(host)}'s <em>place</em>", f"Group night<i>✦</i>Room <b>{code}</b>")
-        settings_menu()
+        marquee("Movie night", f"At {esc(host)}'s<em>.</em>", f"Group night<i>✦</i>Room <b>{code}</b>")
     prefetch_posters([(k, f["name"], f["year"]) for k, f in room["films"].items()])
     seen = group_state(room)
 
@@ -2643,7 +3099,7 @@ def group_view(code, mid):
         if win and len(tied) == 1:
             _, w_yes, _, w_sup, _ = rows[0]
             sup_txt = f' · ★ {w_sup} super-like{"s" if w_sup != 1 else ""}' if w_sup else ""
-            md(f'<div class="its-match"><div class="im-k">✦ The votes are in ✦</div>'
+            md(f'<div class="its-match"><div class="im-k">The votes are in</div>'
                f'<div class="im-t">Tonight\'s <em>pick</em></div>'
                f'<div class="im-n">{w_yes} of {voters} want to watch it{sup_txt}</div></div>')
             region = current_region()
@@ -2657,7 +3113,7 @@ def group_view(code, mid):
                          "double-feature-movie-night.jpg", f"Tonight's movie night pick: {win['name']} 🍿",
                          key=f"share_group_{code}", label="Share the winner")
         elif tied:
-            md(f'<div class="its-match"><div class="im-k">✦ The votes are in ✦</div>'
+            md(f'<div class="its-match"><div class="im-k">The votes are in</div>'
                f'<div class="im-t">It\'s a <em>tie</em></div>'
                f'<div class="im-n">{len(tied)} films are level at the top</div></div>')
         elif not voters:
@@ -2678,7 +3134,7 @@ def group_view(code, mid):
                             f'{esc(e["name"])}</a><span class="row-y">{esc(e["year"])}</span>{star}</div>'
                             f'<div class="gbar"><i style="width:{pct:.0f}%"></i></div>'
                             f'<div class="row-s">{esc(by_names(room, e))}</div></div>'
-                            f'<div class="row-m"><div class="vs-gap" style="color:var(--gold)">{y}'
+                            f'<div class="row-m"><div class="vs-gap">{y}'
                             f'<small>of {voters}</small></div></div></div>')
             md("".join(bars))
         if is_host:
@@ -2695,13 +3151,13 @@ def group_view(code, mid):
 
 
 def group_join_screen(code):
-    room = get_room(code)
+    room = room_snapshot(code, "group")
     with header:
         if room:
             host = room["members"][room["host"]]["name"]
-            marquee("Movie night", f"{esc(host)}'s <em>place</em>", f"Room <b>{code}</b>")
+            marquee("Movie night", f"At {esc(host)}'s<em>.</em>", f"Room <b>{code}</b>")
         else:
-            marquee("Movie night", "Double <em>Feature</em>", "Group night")
+            marquee("Group night", "Movie night<em>?</em>", "")
     if not room:
         note("<b>That movie night has ended.</b> Ask for a new code.")
         st.button("Back", on_click=leave_group)
@@ -2723,27 +3179,28 @@ def group_join_screen(code):
 
 GROUP_CSS = """
 <style>
-.gms { display: flex; flex-wrap: wrap; gap: 6px; margin: .45rem 0 .9rem; }
-.gm { display: flex; align-items: baseline; gap: .45rem; padding: .4rem .75rem .35rem; border-radius: 999px;
-  background: rgba(27,37,54,.85); box-shadow: inset 0 0 0 1px var(--line); font-size: .88rem; }
-.gm-n { color: var(--cream); font-weight: 600; }
-.gm-c { color: var(--muted); font-size: .78rem; }
-.gbar { height: 5px; border-radius: 5px; background: rgba(243,236,221,.08); overflow: hidden; margin-top: .4rem; }
-.gbar i { display: block; height: 100%; background: linear-gradient(90deg, var(--gold), var(--sea)); }
+.gms { display: flex; flex-wrap: wrap; gap: 8px; margin: .5rem 0 1rem; }
+.gm { display: flex; align-items: baseline; gap: .45rem; padding: .4rem .8rem; border-radius: 999px;
+  background: var(--surface); border: 2px solid var(--line); font-size: .9rem; }
+.gm-n { color: var(--text); font-weight: 800; }
+.gm-c { color: var(--muted); font-size: .8rem; font-weight: 600; }
+.gbar { height: 10px; border-radius: 6px; background: var(--surface); border: 1.5px solid var(--line); overflow: hidden; margin-top: .4rem; }
+.gbar i { display: block; height: 100%; background: var(--pink); }
 .reel-item .poster { width: 100%; }
-.tap-card { border-radius: 14px; padding: .65rem .8rem; background: rgba(27,37,54,.8); box-shadow: inset 0 0 0 1px var(--line);
-  border-bottom: 0; margin-top: -.3rem; }
+.tap-card { margin-top: .2rem; }
+.st-key-scatter_card { background: var(--surface); border: 2px solid var(--line); border-radius: 20px; padding: .6rem .7rem .2rem;
+  box-shadow: 4px 4px 0 var(--line); }
 [data-testid="stElementToolbar"] { display: none !important; }  /* chart toolbar covers text on phones */
 /* Touch screens: no hover tooltip (it glitches on tap), the card under the chart does the job instead */
 @media (hover: none) { #vg-tooltip-element { display: none !important; } }
 @media (hover: hover) { .tap-hint { display: none; } }
-.tap-hint { text-align: center; color: var(--muted); font-size: .82rem; margin-top: -.4rem; }
+.tap-hint { text-align: center; color: var(--muted); font-size: .84rem; font-weight: 500; margin-top: .6rem; }
 </style>
 """
 md(GROUP_CSS)
 
 
-header = st.container()
+header = st.container(key="hdr")
 have_both = all(st.session_state.get(k) for k in ("file_a", "file_b"))
 
 # A shared link (?room=CODE) works once per page load, for pair codes and swipe codes alike
@@ -2762,7 +3219,7 @@ if st.session_state.get("group_join"):
     st.stop()
 
 pair_code, me = st.session_state.get("pair"), st.session_state.get("me")
-pair = get_room(pair_code) if pair_code else None
+pair = get_room(pair_code, "pair") if pair_code else None
 if pair_code and not pair:
     unpair()
     st.session_state.join_error = "Your pairing has expired (they last 12 hours). Start a new one below."
@@ -2771,7 +3228,7 @@ paired = bool(pair and all(pair["slots"]) and me is not None)
 # 1. Started a pair, waiting for the other person to upload
 if pair and not paired:
     with header:
-        marquee("Pairing up", f"{esc(pair['slots'][0]['name'])} <em>&amp;</em> …",
+        marquee("Pairing up", f"{esc(pair['slots'][0]['name'])} <em>+</em> …",
                 "Waiting for your plus-one")
     code_card(pair_code, "Send this link, or have them enter the code in Double Feature. They upload their own "
                          "export and both phones open up together.")
@@ -2783,13 +3240,13 @@ if pair and not paired:
 # 2. Joining someone else's pair code
 if not paired and st.session_state.get("pair_join"):
     jc = st.session_state.pair_join
-    room = get_room(jc)
+    room = get_room(jc, "pair")
     with header:
         if room:
-            marquee("Pairing up", f"{esc(room['slots'][0]['name'])} <em>&amp;</em> you",
+            marquee("Pairing up", f"{esc(room['slots'][0]['name'])} <em>+</em> you",
                     f"Pair code <b>{jc}</b>")
         else:
-            marquee("Pairing up", "Double <em>Feature</em>", "Two phones<i>✦</i>One movie night")
+            marquee("Pairing up", "Two phones<em>.</em>", "One movie night")
     if not room:
         note("<b>That code has expired.</b> Ask for a new one.")
         st.button("Back", on_click=unpair)
@@ -2804,6 +3261,8 @@ if not paired and st.session_state.get("pair_join"):
         if st.session_state.get("pj_error"):
             st.error(st.session_state.pj_error)
         st.button("Cancel", on_click=unpair)
+        st.button(f"This is my code (I'm {room['slots'][0]['name']})", type="tertiary",
+                  on_click=rejoin_pair, args=(jc, 0), key="rejoin_host")
     else:
         section("Which one are you?", kicker=f"Pair {jc}", first=True,
                 note="This pair is already set up. Pick your name to open it on this phone.")
@@ -2814,14 +3273,13 @@ if not paired and st.session_state.get("pair_join"):
 
 # 3. Joining a swipe session on a phone with no exports
 if not paired and not have_both and st.session_state.get("room"):
-    room = get_room(st.session_state.room)
+    room = get_room(st.session_state.room, "swipe")
     with header:
         if room:
-            marquee("Swipe night", f"{esc(room['names'][0])} <em>&amp;</em> {esc(room['names'][1])}",
+            marquee("Swipe night", f"{esc(room['names'][0])} <em>+</em> {esc(room['names'][1])}",
                     f"Room <b>{room['code']}</b><i>✦</i><b>{len(room['deck'])}</b> films in the deck")
         else:
-            marquee("Swipe night", "Double <em>Feature</em>", "Two phones<i>✦</i>One film")
-        settings_menu()
+            marquee("Swipe night", "Swipe till<br>you match<em>.</em>", "Two phones, one film")
     swipe_view(st.session_state.room)
     if room:
         st.button("Leave this session", on_click=leave_room)
@@ -2842,9 +3300,11 @@ else:
         format_func={"own": "Two phones", "one": "One phone", "group": "Group night"}.get) or "own"
     if not have_both:
         with header:
-            marquee("Now showing", "Double <em>Feature</em>",
-                    "A whole group<i>✦</i>One movie night" if mode == "group"
-                    else "Two Letterboxd accounts<i>✦</i>One movie night")
+            if mode == "group":
+                marquee("Group night", "Movie night<em>?</em>",
+                        "Everyone brings a few films, everyone swipes, and one film wins.")
+            else:
+                marquee("", "Movie<br>night<em>?</em>", "Swipe till you match. No more scrolling for an hour.")
             how_it_works(pairing=mode == "own", group=mode == "group")
 
     if mode == "group":
@@ -2880,13 +3340,6 @@ else:
         st.stop()
     raw_a, raw_b = bundle(file_a), bundle(file_b)
 
-def safe_load(raw):
-    try:
-        return load_export(raw) if raw else None
-    except (zipfile.BadZipFile, pd.errors.ParserError, UnicodeDecodeError):
-        return None
-
-
 da, db = safe_load(raw_a), safe_load(raw_b)
 bad = [label for label, d in (("the first person", da), ("the second person", db)) if not d or not d["found"]]
 if bad:
@@ -2897,11 +3350,11 @@ if bad:
     st.stop()
 
 # Names: whatever was typed, else the name on the Letterboxd profile, else a placeholder
-A = name_a.strip() or da["name"] or "Person 1"
-B = name_b.strip() or db["name"] or "Person 2"
+A = clean_name(name_a) or da["name"] or "Person 1"
+B = clean_name(name_b) or db["name"] or "Person 2"
 if A.casefold() == B.casefold():
     B = f"{B} (2)"
-COLOURS.update({A: GOLD, B: SEA})
+COLOURS.update({A: "var(--pa)", B: "var(--pb)"})
 
 # Paired: let this phone know when the other one starts a swipe session
 if paired and pair["swipe"] and pair["swipe"] != st.session_state.get("seen_swipe"):
@@ -2914,9 +3367,8 @@ shared_wl = pa["watchlist"] & pb["watchlist"]
 both_seen = pa["seen"] & pb["seen"]
 
 with header:
-    marquee("Now showing", f"{esc(A)} <em>&amp;</em> {esc(B)}",
+    marquee("Now showing", f"{esc(A)} <em>+</em> {esc(B)}",
             f"<b>{len(both_seen)}</b> seen together<i>✦</i><b>{len(shared_wl)}</b> on both watchlists")
-    settings_menu()
 
 t_pick, t_swipe, t_taste, t_swap, t_stats = st.tabs(["Pick", "Swipe", "Taste", "Swaps", "Stats"])
 
@@ -2953,7 +3405,7 @@ with t_pick:
 
     decades = sorted({int(y) // 10 * 10 for y in cat.loc[list(pool), "Year"].dropna()})
     chosen = filters.pills("Decades", decades, selection_mode="multi",
-                           format_func=lambda d: f"{str(d)[2:]}s") if decades else []
+                           format_func=lambda d: f"{str(d)[2:]}s" if d >= 1930 else f"{d}s") if decades else []
     if chosen:
         pool = {k: why for k, why in pool.items()
                 if pd.notna(cat.at[k, "Year"]) and int(cat.at[k, "Year"]) // 10 * 10 in chosen}
@@ -2961,8 +3413,13 @@ with t_pick:
     # Film details: length, genre and where it's streaming (only when a TMDB key is set up)
     region, infos = current_region(), {}
     if tmdb_on() and pool:
+        items_ = [(k, str(cat.at[k, "Name"]), cat.at[k, "Year"]) for k in pool]
         with st.spinner("Fetching film details…"):
-            infos = film_infos([(k, str(cat.at[k, "Name"]), cat.at[k, "Year"]) for k in pool])
+            infos = film_infos(items_)
+        late = [i for i in items_ if i[0] not in infos
+                and _detail_key(i[1], _norm_year(i[2])) in _film_store().get("pending", {})]
+        if late:  # only while lookups are actually still running, so this can't loop
+            details_catchup(late)
         remember_posters(infos)
         lengths = {"any": "Any length", "90": "Under 1½h", "120": "Under 2h", "150": "Under 2½h"}
         max_len = filters.segmented_control("Length", list(lengths), default="any", key="f_len",
@@ -3020,6 +3477,7 @@ with t_pick:
 
 def start_room(names, deck):
     st.session_state.room = create_room(names, deck)
+    st.session_state.qp_handled = st.session_state.room
 
 
 with t_swipe:
@@ -3029,7 +3487,7 @@ with t_swipe:
              "uri": str(cat.at[k, "Letterboxd URI"]) if pd.notna(cat.at[k, "Letterboxd URI"]) else "",
              "why": reason_plain(why), "meta": details_text(infos.get(k)),
              "stream": stream_text(infos.get(k), region)} for k, why in pool.items()]
-    if paired and sc and get_room(sc):
+    if paired and sc and get_room(sc, "swipe"):
         seat = [A, B][me]
         if st.session_state.get(f"seat_{sc}") != seat:
             choose_seat(sc, seat)
@@ -3050,7 +3508,7 @@ with t_swipe:
             st.button(f"Start swiping · {min(len(deck), DECK_MAX)} films", type="primary", width="stretch",
                       on_click=start_pair_swipe, args=(pair_code, [A, B], deck, [A, B][me]))
             st.caption("The deck is the Pick tab's pool, including any filters you've set there.")
-    elif code and get_room(code):
+    elif code and get_room(code, "swipe"):
         swipe_view(code, host=True)
         st.button("End swipe session", on_click=leave_room)
     else:
@@ -3103,8 +3561,9 @@ with t_taste:
                      label="Share our taste match")
 
         section("Side by side", kicker="Every shared rating",
-                note=f'Each dot is a film. <span style="color:{GOLD}">Gold</span>: {esc(A)} rated it higher. '
-                     f'<span style="color:{SEA}">Green</span>: {esc(B)} did. On the line: you agreed.')
+                note=f'Each dot is a film. <span style="color:var(--pa-ink);font-weight:800">Pink</span>: {esc(A)} rated '
+                     f'it higher. <span style="color:var(--pb-ink);font-weight:800">Blue</span>: {esc(B)} did. '
+                     f'Yellow: you agreed.')
         rng = random.Random(7)
         plot = pd.DataFrame({"k": list(common), "Film": cat.loc[common, "Name"].values,
                              "a": ra.values, "b": rb.values})
@@ -3115,26 +3574,25 @@ with t_taste:
         ax = dict(values=[1, 2, 3, 4, 5], labelExpr="datum.value + '★'")
         # Tapping (or clicking) picks the nearest dot, so it works on phones where there's no hover
         tap = alt.selection_point(name="tap", fields=["k"], on="click", nearest=True, clear="dblclick")
-        points = alt.Chart(plot).mark_circle(stroke="#111926", strokeWidth=1).encode(
+        points = alt.Chart(plot).mark_circle(stroke=TOKENS["line"], strokeWidth=1.5).encode(
             x=alt.X("aj:Q", title=f"{A} →", scale=scale, axis=alt.Axis(**ax)),
             y=alt.Y("bj:Q", title=f"{B} →", scale=scale, axis=alt.Axis(**ax)),
-            color=alt.Color("Higher:N", scale=alt.Scale(domain=[A, B, "Agreed"], range=[GOLD, SEA, CREAM]),
+            color=alt.Color("Higher:N", scale=alt.Scale(domain=[A, B, "Agreed"], range=[TOKENS["pa"], TOKENS["pb"], TOKENS["butter"]]),
                             legend=None),
             size=alt.condition(tap, alt.value(260), alt.value(110)),
-            opacity=alt.value(0.85),
-            strokeWidth=alt.condition(tap, alt.value(3), alt.value(1)),
-            stroke=alt.condition(tap, alt.value(CREAM), alt.value("#111926")),
+            opacity=alt.value(1),
+            strokeWidth=alt.condition(tap, alt.value(3.5), alt.value(1.5)),
+            stroke=alt.value(TOKENS["line"] if TOKENS["is-dark"] == "0" else TOKENS["text"]),
             tooltip=["Film", alt.Tooltip("a:Q", title=A), alt.Tooltip("b:Q", title=B)],
         ).add_params(tap)
         diagonal = alt.Chart(pd.DataFrame({"aj": [0.25, 5.25], "bj": [0.25, 5.25]})).mark_line(
-            strokeDash=[3, 5], color="#5C6A82", strokeWidth=1.5).encode(x="aj:Q", y="bj:Q")
+            strokeDash=[4, 5], color=TOKENS["muted"], strokeWidth=1.5).encode(x="aj:Q", y="bj:Q")
         chart = (diagonal + points).properties(height=330).configure(
-            background="transparent", font="DM Sans").configure_view(stroke=None).configure_axis(
-            labelColor=MUTED, titleColor=MUTED, gridColor="#ffffff12", domain=False, ticks=False,
-            labelFontSize=12, titleFontSize=12, titleFontWeight=500, labelPadding=8, titlePadding=10)
-        event = st.altair_chart(chart, theme=None, on_select="rerun", selection_mode="tap", key="taste_scatter")
-        prefetch_posters([(k, str(cat.at[k, "Name"]), cat.at[k, "Year"]) for k in common
-                          if (ra[k] >= 4.5 and rb[k] >= 4.5) or abs(ra[k] - rb[k]) >= 1.5])
+            background="transparent", font="Bricolage Grotesque").configure_view(stroke=None).configure_axis(
+            labelColor=TOKENS["muted"], titleColor=TOKENS["text"], gridColor=TOKENS["track"], domain=False,
+            ticks=False, labelFontSize=12, titleFontSize=13, titleFontWeight=700, labelPadding=8, titlePadding=10)
+        with st.container(key="scatter_card"):
+            event = st.altair_chart(chart, theme=None, on_select="rerun", selection_mode="tap", key="taste_scatter")
         picked = [p.get("k") for p in (event.selection.get("tap") or []) if isinstance(p, dict)] if event else []
         k = picked[0] if picked and picked[0] in ra.index else None
         if k:
@@ -3149,10 +3607,13 @@ with t_taste:
         section("You both loved", kicker=f"{len(loved)} mutual favourites" if loved else "Mutual favourites",
                 note="Films you each gave 4½★ or more.")
         if loved:
+            shown_loved, more_loved = show_all(loved, "all_loved", 20)
             items = "".join(
                 f'<div class="reel-item">{poster(k)}<div class="reel-cap">'
-                f'{rating_line(A, ra[k])}{rating_line(B, rb[k])}</div></div>' for k in loved)
+                f'{rating_line(A, ra[k])}{rating_line(B, rb[k])}</div></div>' for k in shown_loved)
             md(f'<div class="reel">{items}</div>')
+            if more_loved:
+                show_all_toggle(loved, "all_loved")
         else:
             note("No films you both rated 4½★ or higher yet. Get watching.")
 
@@ -3179,13 +3640,15 @@ with t_swap:
     frm = B if to == A else A
     pto, pfrm = (pa, pb) if to == A else (pb, pa)
     recs = pfrm["ratings"][(pfrm["ratings"] >= threshold) & ~pfrm["ratings"].index.isin(list(pto["seen"]))]
-    if recs.empty:
+    if pfrm["ratings"].empty:
+        note(f"<b>Nothing to go on yet.</b> {esc(frm)} hasn't rated any films on Letterboxd.")
+    elif recs.empty:
         note(f"<b>All caught up.</b> {esc(to)} has already seen everything {esc(frm)} rated "
              f"{stars(threshold)} or higher.")
     else:
         order = sorted(recs.index, key=lambda k: (-recs[k], str(cat.at[k, "Name"]).casefold()))
         prefetch_posters([(k, str(cat.at[k, "Name"]), cat.at[k, "Year"]) for k in order[:60]])
-        md(f'<div class="sec-n" style="margin:.4rem 0 .2rem">{dot(frm)}<b style="color:var(--cream)">'
+        md(f'<div class="sec-n" style="margin:.4rem 0 .2rem">{dot(frm)}<b style="color:var(--text)">'
            f'{len(order)} picks from {esc(frm)}</b> that {esc(to)} hasn\'t seen</div>')
         film_rows(order, key=f"all_recs_{to}", limit=12,
                   meta=lambda k: star_bar(recs[k], COLOURS[frm]),
@@ -3199,8 +3662,8 @@ def pct_split(x, y) -> str:
     if not tot:
         return '<div class="tape-bar"></div>'
     a = 100 * (x or 0) / tot
-    return (f'<div class="tape-bar"><i style="width:{a:.1f}%;background:{GOLD}"></i>'
-            f'<i style="flex:1;background:{SEA}"></i></div>')
+    return (f'<div class="tape-bar"><i style="width:{a:.1f}%;background:var(--pa)"></i>'
+            f'<i style="flex:1;background:var(--pb)"></i></div>')
 
 
 def fav_decade(p):
@@ -3231,15 +3694,15 @@ with t_stats:
         ("Average rating", avg(pa), avg(pb), "{:.2f}★"),
     ]
     tape = "".join(
-        f'<div class="tape-r"><b style="color:{GOLD}">{fmt.format(x) if x is not None else "–"}</b>'
-        f'<span>{label}</span><b style="color:{SEA}">{fmt.format(y) if y is not None else "–"}</b>'
+        f'<div class="tape-r"><b style="color:var(--pa-ink)">{fmt.format(x) if x is not None else "–"}</b>'
+        f'<span>{label}</span><b style="color:var(--pb-ink)">{fmt.format(y) if y is not None else "–"}</b>'
         f'{pct_split(x, y)}</div>'
         for label, x, y, fmt in rows)
-    tape += (f'<div class="tape-r"><b style="color:{GOLD}">{fav_decade(pa)}</b><span>Favourite decade</span>'
-             f'<b style="color:{SEA}">{fav_decade(pb)}</b></div>')
+    tape += (f'<div class="tape-r"><b style="color:var(--pa-ink)">{fav_decade(pa)}</b><span>Favourite decade</span>'
+             f'<b style="color:var(--pb-ink)">{fav_decade(pb)}</b></div>')
     section("Tale of the tape", kicker="Head to head", first=True)
-    md(f'<div class="tape"><div class="tape-h"><span style="color:{GOLD}">{esc(A)}</span><i>vs</i>'
-       f'<span style="color:{SEA}">{esc(B)}</span></div>{tape}</div>'
+    md(f'<div class="tape"><div class="tape-h"><span style="color:var(--pa-ink)">{esc(A)}</span><i>vs</i>'
+       f'<span style="color:var(--pb-ink)">{esc(B)}</span></div>{tape}</div>'
        f'<div class="together"><div><b>{len(both_seen)}</b><span>Seen by both</span></div>'
        f'<div><b>{len(shared_wl)}</b><span>Shared watchlist</span></div></div>')
 
@@ -3262,7 +3725,7 @@ with t_stats:
         levels = [lv for lv in levels if sa.get(lv, 0) or sb.get(lv, 0)]
         section("How you hand out stars", kicker="Generosity check",
                 note="Share of each person's ratings at every star level.")
-        md(butterfly([(star_bar(lv, CREAM), float(sa.get(lv, 0)), float(sb.get(lv, 0))) for lv in levels],
+        md(butterfly([(star_bar(lv), float(sa.get(lv, 0)), float(sb.get(lv, 0))) for lv in levels],
                      fmt=lambda v: f"{v:.0%}" if v else ""))
 
 attribution()

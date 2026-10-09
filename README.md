@@ -2,11 +2,11 @@
 
 **Two Letterboxd accounts, one movie night.**
 
-Double Feature compares two people's Letterboxd data and helps them pick something to watch together. It's built for phones and styled like an old movie palace.
+Double Feature compares two people's Letterboxd data and helps them pick something to watch together. It's built for phones, with a bright, playful look and your choice of background colour.
 
 👉 **[Open the app](https://double-feature.streamlit.app/)**
 
-![Double Feature on a phone: the Pick, Swipe and Taste tabs, plus group night voting and the winning film](preview.png)
+![Double Feature on a phone: the Pick and Swipe tabs, the Taste tab in dark mode, plus group night voting and the winning film](preview.png)
 
 ---
 
@@ -25,7 +25,7 @@ There's also a **Group night** mode for more than two people. Everyone brings a 
 On top of that:
 
 - **Film details:** each film shows its length and genre, and **where it's streaming** in your country.
-- **Poster style:** under **Settings**, each person can choose the minimal generated art or the films' real posters.
+- **Settings:** tap **Settings** at the top to pick a background colour (Lavender, Butter, Blush or Periwinkle) or **Dark**, choose minimal poster art or the films' real posters, and set your streaming country. The app goes dark on its own when your phone is in dark mode, unless you switch that off. Your choices are remembered on that phone.
 - **Share:** a **Share** button turns tonight's pick, your match, your taste-match score or the group winner into an image for WhatsApp or Instagram.
 
 ## How to use it
@@ -65,7 +65,7 @@ Hosting friends? Pick **Group night** on the start screen.
 - Names are optional. If you leave yours blank, the app uses the name on your Letterboxd profile.
 - To try it out on your own, choose **One phone** and upload your export into both boxes.
 - If someone refreshes the page during a pairing, they just open the same link again and tap their name.
-- The streaming country is set from your browser. You can change it under **Settings**, next to the poster style.
+- The streaming country is set from your browser. You can change it under **Settings**.
 
 ## Privacy
 
@@ -112,7 +112,8 @@ It opens in your browser. To try it on a phone on the same Wi-Fi, use the **Netw
 - **Film details:** films are looked up on TMDB by title and year. Details are cached in memory for a week, and if TMDB is unreachable the app stops asking for 10 minutes.
 - **Pairing and swiping:** rooms live in server memory (`st.cache_resource`) under a four-letter code. Both phones check for changes every couple of seconds. The swipe cards are a small custom component (`st.components.v2`) that supports dragging and buttons.
 - **Sharing:** uses the phone's own share sheet where it's available, otherwise the image downloads.
-- **Theme and fonts:** set in `.streamlit/config.toml`. The fonts (Fraunces, DM Sans and Bebas Neue) are served from `static/`, with TTF copies in `static/share/` for drawing share images.
+- **Look and colours:** `.streamlit/config.toml` sets the light base theme. The background colours and dark mode are CSS variables the app swaps in per person, and the choice is saved in the phone's browser storage (nothing is sent anywhere).
+- **Fonts:** Bricolage Grotesque (SIL Open Font License, see `static/share/OFL-bricolage.txt`) is served from `static/`, with TTF copies in `static/share/` for drawing share images. The `fallback-*` fonts are trimmed copies of DejaVu Sans and DejaVu Serif, used for names and titles with letters Bricolage doesn't have (Greek, Cyrillic and so on).
 
 ```
 ├── app.py
@@ -120,15 +121,15 @@ It opens in your browser. To try it on a phone on the same Wi-Fi, use the **Netw
 ├── .streamlit/
 │   └── config.toml
 └── static/
-    ├── bebas-neue.woff2
-    ├── dm-sans.woff2
-    ├── fraunces.woff2
-    ├── fraunces-italic.woff2
+    ├── bricolage.woff2
+    ├── bricolage-ext.woff2
     └── share/
-        ├── bebas-neue.ttf
-        ├── dm-sans-500.ttf
-        ├── fraunces-600.ttf
-        └── fraunces-italic.ttf
+        ├── bricolage-500.ttf
+        ├── bricolage-700.ttf
+        ├── bricolage-800.ttf
+        ├── OFL-bricolage.txt
+        ├── fallback-sans.ttf
+        └── fallback-serif.ttf
 ```
 
 ## Limitations
