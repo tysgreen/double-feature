@@ -162,6 +162,41 @@ a { -webkit-tap-highlight-color: transparent; }
 /* The CSS blocks render as empty markdown elements; drop them so they don't add gaps above the header */
 [data-testid="stElementContainer"]:has(style) { display: none !important; }
 
+/* ---------- Motion: things that appear after a tap ease in instead of popping into place ---------- */
+@keyframes df-in { from { opacity: 0; transform: translateY(8px); } }
+@keyframes df-drop { from { opacity: 0; transform: translateY(-10px) scale(.97); } }
+@keyframes df-pop { from { opacity: 0; transform: scale(.94); } }
+@keyframes df-fade { from { opacity: 0; } }
+/* a new screen: its label, title and line slide up in turn */
+.mq-kick, .mq-title, .mq-sub { animation: df-in .4s cubic-bezier(.2, .8, .2, 1) both; }
+.mq-title { animation-delay: .04s; } .mq-sub { animation-delay: .08s; }
+/* start screen cards arrive one after another */
+.steps3, .start-k { animation: df-in .4s cubic-bezier(.2, .8, .2, 1) both; animation-delay: .06s; }
+[class*="st-key-pick_"] .choice { animation: df-in .45s cubic-bezier(.2, .8, .2, 1) both; }
+.st-key-pick_own .choice { animation-delay: .1s; } .st-key-pick_group .choice { animation-delay: .16s; }
+.st-key-pick_one .choice { animation-delay: .22s; }
+/* boxes that appear in response to something */
+.st-key-reset_box { animation: df-drop .3s cubic-bezier(.2, .8, .2, 1) both; transform-origin: top center; }
+[data-testid="stPopoverBody"] { animation: df-pop .2s cubic-bezier(.2, .8, .2, 1) both; transform-origin: top right; }
+[data-testid="stExpander"] details[open] > [data-testid="stExpanderDetails"] { animation: df-in .28s ease-out both; }
+[data-testid="stTabPanel"] > * { animation: df-fade .25s ease-out both; }
+.saved, .room { animation: df-pop .32s cubic-bezier(.2, .8, .2, 1.1) both; }
+.note, .mn-row, .guide, .how { animation: df-in .3s ease-out both; }
+[data-testid="stAlertContainer"] { animation: df-in .25s ease-out both; }
+.st-key-saved_btns, .st-key-reset_btns { animation: df-fade .3s ease-out .08s both; }
+/* every button gives a little under your finger */
+button { transition: transform .12s ease, box-shadow .12s ease, background-color .2s ease, color .2s ease,
+  border-color .2s ease, opacity .2s ease, filter .15s ease; }
+[data-testid^="stBaseButton"]:not(:disabled):active, button[data-variant]:active, .sw-btn:active, .share-btn:active {
+  transform: translate(1px, 1px) scale(.98); }
+@media (prefers-reduced-motion: reduce) {
+  .mq-kick, .mq-title, .mq-sub, .steps3, .start-k, [class*="st-key-pick_"] .choice, .st-key-reset_box,
+  [data-testid="stPopoverBody"], [data-testid="stExpanderDetails"], [data-testid="stTabPanel"] > *, .saved, .room,
+  .note, .mn-row, .guide, .how, [data-testid="stAlertContainer"], .st-key-saved_btns, .st-key-reset_btns {
+    animation: none !important; }
+  button { transition: none !important; }
+}
+
 /* ---------- Header ---------- */
 .st-key-hdr { position: relative; }
 .st-key-settings_wrap { position: absolute !important; top: .15rem; right: 0; width: auto !important; z-index: 5; }
@@ -1441,7 +1476,9 @@ def logo_svg(px: int, shadow: bool = True) -> str:
 
 def marquee(kicker: str, title: str, sub: str = ""):
     """The header on every screen: wordmark, Settings, a small label, a big title and a line under it."""
-    md(f'<div class="marquee"><div class="mq-brand">{logo_svg(38)}<div>double<span>·</span>feature</div></div>'
+    # st.html swaps the whole header in when the screen changes, so the title's entrance animation replays
+    # (st.markdown would patch the text in place and the new screen would just snap in)
+    st.html(f'<div class="marquee"><div class="mq-brand">{logo_svg(38)}<div>double<span>·</span>feature</div></div>'
        + (f'<div class="mq-kick">{kicker}</div>' if kicker else "")
        + f'<div class="mq-title">{title}</div>'
        + (f'<div class="mq-sub">{sub}</div>' if sub else "") + '</div>')
