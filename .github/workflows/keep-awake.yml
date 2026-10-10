@@ -1,0 +1,45 @@
+# Opens the app every 6 hours so Streamlit Community Cloud doesn't put it to sleep
+# (it sleeps after 12 hours without visitors). If it's already asleep, this wakes it up.
+# Runs on GitHub's free Actions minutes; you can also run it by hand from the Actions tab.
+name: Keep the app awake
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install a headless browser
+        run: |
+          pip install playwright==1.47.0
+          python -m playwright install --with-deps chromium
+      - name: Open the app
+        env:
+          APP_URL: https://double-feature.streamlit.app/
+        run: |
+          python - <<'PY'
+          import os
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          with sync_playwright() as p:
+              page = p.chromium.launch().new_page()
+              page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+              page.wait_for_timeout(10_000)
+              # A sleeping app shows a "get this app back up" button
+              wake = page.get_by_role("button", name="get this app back up", exact=False)
+              if wake.count():
+                  print("The app was asleep. Waking it up.")
+                  wake.first.click()
+                  page.wait_for_timeout(90_000)
+              else:
+                  print("The app is awake.")
+                  page.wait_for_timeout(20_000)
+          PY
