@@ -526,13 +526,16 @@ export default function(component) {
     const s = document.createElement('script');
     s.async = true; s.src = 'https://gc.zgo.at/count.js';
     s.dataset.goatcounter = 'https://' + counts.site + '.goatcounter.com/count';
-    s.dataset.goatcounterSettings = JSON.stringify({ no_onload: true, allow_local: false });
+    // On Streamlit Cloud the app runs inside a frame, which GoatCounter ignores unless told otherwise
+    s.dataset.goatcounterSettings = JSON.stringify({ no_onload: true, allow_frame: true });
     document.head.appendChild(s);
   }
-  const send = (name) => {
-    const go = () => window.goatcounter && window.goatcounter.count &&
+  const send = (name, tries = 0) => {  // the counter script loads in the background, so wait for it (up to ~15s)
+    if (window.goatcounter && window.goatcounter.count) {
       window.goatcounter.count({ path: 'event/' + name, title: name, event: true });
-    if (window.goatcounter && window.goatcounter.count) go(); else setTimeout(go, 1500);
+    } else if (tries < 30) {
+      setTimeout(() => send(name, tries + 1), 500);
+    }
   };
 
   const seen = (data && data.seen) || {};
