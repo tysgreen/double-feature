@@ -152,9 +152,9 @@ CSS = """
 
 /* Page: a soft background the person picks in Settings (or After dark) */
 .stApp { background: var(--bg); color: var(--text); font-family: var(--sans); }
-[data-testid="stHeader"] { background: transparent; }
-/* The top padding leaves room for the hosting toolbar (Streamlit Cloud puts its icons up there) */
-[data-testid="stMainBlockContainer"], .block-container { max-width: 560px; padding: 3.4rem 1rem 6rem; }
+[data-testid="stHeader"] { display: none; }
+/* Streamlit's top bar is hidden (above), so the page starts near the top */
+[data-testid="stMainBlockContainer"], .block-container { max-width: 560px; padding: 1.1rem 1rem 6rem; }
 [data-testid="stMarkdownContainer"] { color: var(--text); }
 [data-testid="stMarkdownContainer"] p { margin-bottom: 0; }
 a { -webkit-tap-highlight-color: transparent; }
@@ -470,9 +470,7 @@ export default function(component) {
   const dark = !!(mq && mq.matches);
   let saved = {};
   try { saved = JSON.parse(window.localStorage.getItem(KEY) || '{}') || {}; } catch (e) { saved = {}; }
-  if (data && data.save) {
-    try { window.localStorage.setItem(KEY, JSON.stringify(data.save)); } catch (e) {}
-  }
+
   try {  // the icon a phone uses for "Add to Home Screen"
     if (!document.querySelector('link[rel="apple-touch-icon"]')) {
       const l = document.createElement('link');
@@ -481,7 +479,18 @@ export default function(component) {
     }
   } catch (e) {}
   const seen = (data && data.seen) || {};
-  if (!seen.loaded || seen.dark !== dark) setStateValue('env', { dark, saved });
+  const cur = (data && data.save) || {};
+  if (window.__dfPrefsSid !== seen.sid) {
+    // First render for this session (a fresh page, or the app reconnected with a new session): only ask the
+    // app to run again if something actually differs (a saved colour or poster style, or the phone being in
+    // dark mode). Otherwise there's nothing to do, and nothing is saved until the session has been checked.
+    window.__dfPrefsSid = seen.sid;
+    const differs = ['theme', 'auto', 'posters'].some(k => saved[k] !== undefined && saved[k] !== cur[k]);
+    if (differs || seen.dark !== dark) setStateValue('env', { dark, saved: differs ? saved : {} });
+    return;
+  }
+  try { if (data && data.save) window.localStorage.setItem(KEY, JSON.stringify(data.save)); } catch (e) {}
+  if (seen.dark !== dark) setStateValue('env', { dark, saved: {} });
 }
 """
 prefs_store = st.components.v2.component("prefs", js=PREFS_JS, isolate_styles=False)
@@ -507,9 +516,9 @@ st.markdown("<style>:root{" + ";".join(f"--{k}:{v}" for k, v in TOKENS.items()) 
             unsafe_allow_html=True)
 _ss = st.session_state
 prefs_store(key="prefs", on_env_change=on_prefs,
-            data={"seen": {"loaded": bool(_ss.get("prefs_loaded")), "dark": bool(_ss.get("phone_dark"))},
-                  "save": ({"theme": _ss.get("theme") or "lavender", "auto": bool(_ss.get("auto_dark")),
-                            "posters": _ss.get("poster_style") or "art"} if _ss.get("prefs_loaded") else None)})
+            data={"seen": {"dark": bool(_ss.get("phone_dark")), "sid": _ss.setdefault("prefs_sid", secrets.token_hex(4))},
+                  "save": {"theme": _ss.get("theme") or "lavender", "auto": bool(_ss.get("auto_dark")),
+                           "posters": _ss.get("poster_style") or "art"}})
 
 COLOURS = {}
 esc = html.escape
@@ -2423,6 +2432,37 @@ SWIPE_CSS = """
   font-weight: 700; letter-spacing: .14em; font-size: .78rem; text-transform: uppercase; }
 .or:before, .or:after { content: ""; flex: 1; height: 2px; background: var(--line); opacity: .25; }
 .how-n { color: var(--muted); font-size: .82rem; margin: -.3rem 0 .2rem; }
+.steps3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: .2rem 0 1.5rem; }
+.steps3 div { display: flex; flex-direction: column; gap: .45rem; font-size: .84rem; font-weight: 700; line-height: 1.2;
+  color: var(--text); }
+.steps3 b { width: 1.9rem; height: 1.9rem; border-radius: 50%; display: grid; place-items: center; font-weight: 800;
+  background: var(--butter); color: #1F1A17; border: 2px solid var(--line); box-sizing: border-box; }
+.steps3 div:nth-child(2) b { background: var(--pink); } .steps3 div:nth-child(3) b { background: var(--blue); }
+.start-k { font-weight: 700; letter-spacing: .14em; font-size: .78rem; color: var(--muted); text-transform: uppercase;
+  margin-bottom: .1rem; }
+.st-key-join_row { gap: .6rem; flex-wrap: nowrap !important; }
+.st-key-join_row [data-testid="stElementContainer"]:has([data-testid="stTextInput"]) { flex: 1 1 auto; min-width: 0; }
+.st-key-join_row button { min-width: 6.5rem; min-height: 2.75rem; }
+.start-n { color: var(--muted); font-size: .82rem; text-align: center; margin-top: 1.2rem; }
+/* The three start choices: a whole card is the button (a real, invisible button laid over it) */
+[class*="st-key-pick_"] { position: relative; }
+[class*="st-key-go_"] { position: absolute !important; inset: 0; z-index: 2; margin: 0 !important; }
+[class*="st-key-go_"] [data-testid="stButton"], [class*="st-key-go_"] button { width: 100%; height: 100%; }
+[class*="st-key-go_"] button { opacity: 0; min-height: 0 !important; }
+.choice { display: flex; align-items: center; justify-content: space-between; gap: 1rem; border-radius: 22px;
+  padding: 1.1rem 1.2rem; border: 2px solid var(--line); box-shadow: 3px 3px 0 var(--line); color: #1F1A17;
+  transition: transform .12s; }
+.choice.ch-butter { background: var(--butter); padding: 1.5rem 1.2rem; }
+.choice.ch-pink { background: var(--pink); }
+.choice.ch-plain { background: var(--surface); color: var(--text); box-shadow: none; }
+.ch-t { font-weight: 800; font-size: 1.45rem; letter-spacing: -.03em; line-height: 1.05; }
+.ch-butter .ch-t { font-size: 1.8rem; }
+.ch-s { font-size: .92rem; font-weight: 500; margin-top: .3rem; line-height: 1.35; opacity: .85; }
+.ch-go { flex: none; width: 2.6rem; height: 2.6rem; border-radius: 50%; display: grid; place-items: center;
+  background: #1F1A17; color: #F6D776; font-weight: 800; font-size: 1.25rem; }
+.ch-plain .ch-go { background: transparent; color: var(--text); border: 2px solid var(--line); box-sizing: border-box; }
+[class*="st-key-pick_"]:active .choice { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--line); }
+[class*="st-key-pick_"]:has(button:focus-visible) .choice { outline: 3px solid var(--accent-ink); outline-offset: 3px; }
 .how { display: grid; gap: 10px; margin: .9rem 0 1.2rem; }
 .how div { display: flex; gap: .8rem; align-items: center; border-radius: 18px; padding: .8rem .9rem;
   background: var(--surface); border: 2px solid var(--line); font-size: .93rem; font-weight: 600; line-height: 1.35; }
@@ -2639,15 +2679,6 @@ def code_card(code, text, label="Pair code"):
         st.code(link, language=None)
 
 
-def join_box():
-    md('<div class="or"><span>or</span></div>')
-    c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
-    c1.text_input("Have a code?", key="join_code", max_chars=4, placeholder="ABCD")
-    c2.button("Join", width="stretch", on_click=join_room)
-    if st.session_state.get("join_error"):
-        st.caption(st.session_state.join_error)
-
-
 UPLOAD_HELP = ("On letterboxd.com (not the phone app) go to Settings → Data → Export your data. "
                "Upload the .zip, or the watched, ratings and watchlist CSVs inside it.")
 NAME_HELP = "Leave blank to use the name on your Letterboxd profile."
@@ -2657,9 +2688,9 @@ NAME_HINT = "Optional"
 EXPORT_URL = "https://letterboxd.com/settings/data/"
 
 
-def export_guide(group=False, expanded=False):
+def export_guide(group=False, expanded=False, label="How do I get my Letterboxd export?"):
     """A one-tap link to Letterboxd's export page plus illustrated steps (drawn, so they never go stale)."""
-    with st.expander("How do I get my Letterboxd export?", expanded=expanded):
+    with st.expander(label, expanded=expanded):
         st.link_button("Open Letterboxd's export page", EXPORT_URL, icon=":material/open_in_new:", width="stretch")
         steps = []
         if group:
@@ -2724,6 +2755,41 @@ GUIDE_CSS = """
 </style>
 """
 md(GUIDE_CSS)
+
+
+def go_start():
+    st.session_state.start = None
+    st.session_state.pop("sp_error", None)
+
+
+def _choose(mode):
+    st.session_state.start = mode
+
+
+START_CHOICES = [
+    ("own", "Two phones", "You and one other person, each on your own phone.", "ch-butter"),
+    ("group", "Group night", "Three or more of you. Everyone brings a few films.", "ch-pink"),
+    ("one", "One phone", "Upload both of your exports on this phone.", "ch-plain"),
+]
+
+
+def start_screen():
+    """The first screen: how it works in three steps, then one big choice, then a code box for joiners."""
+    md('<div class="steps3"><div><b>1</b>Export from Letterboxd</div><div><b>2</b>Pair your phones</div>'
+       '<div><b>3</b>Swipe till you match</div></div>')
+    md('<div class="start-k">Who\'s watching?</div>')
+    for key, title, sub, cls in START_CHOICES:
+        with st.container(key=f"pick_{key}"):
+            md(f'<div class="choice {cls}"><div><div class="ch-t">{title}</div><div class="ch-s">{sub}</div></div>'
+               '<span class="ch-go" aria-hidden="true">→</span></div>')
+            st.button(title, key=f"go_{key}", on_click=_choose, args=(key,), width="stretch")
+    md('<div class="or"><span>Got a code?</span></div>')
+    with st.container(horizontal=True, vertical_alignment="center", key="join_row"):
+        st.text_input("Have a code?", key="join_code", max_chars=4, placeholder="ABCD", label_visibility="collapsed")
+        st.button("Join", on_click=join_room)
+    if st.session_state.get("join_error"):
+        st.caption(st.session_state.join_error)
+    md('<div class="start-n">Your Letterboxd data stays in the app\'s memory for up to 12 hours and is never saved.</div>')
 
 
 def how_it_works(pairing=True, group=False):
@@ -3368,39 +3434,41 @@ if paired:
         st.button("Unpair this phone", on_click=unpair)
     pair_pulse(pair_code, pair_state(pair))
 else:
-    mode = "one" if have_both else st.segmented_control(
-        "How are you doing this?", ["own", "one", "group"], default="own", key="mode",
-        label_visibility="collapsed",
-        format_func={"own": "Two phones", "one": "One phone", "group": "Group night"}.get) or "own"
-    if not have_both:
+    start = "one" if have_both else st.session_state.get("start")
+    if start not in ("own", "one", "group"):
         with header:
-            if mode == "group":
-                marquee("Group night", "Movie night<em>?</em>",
-                        "Everyone brings a few films, everyone swipes, and one film wins.")
-            else:
-                marquee("", "Movie<br>night<em>?</em>", "Swipe till you match. No more scrolling for an hour.")
-            how_it_works(pairing=mode == "own", group=mode == "group")
+            marquee("", "Movie<br>night<em>?</em>", "Swipe till you match. No more scrolling for an hour.")
+        start_screen()
+        st.stop()
+    if not have_both:
+        st.button("Back", icon=":material/arrow_back:", type="tertiary", key="back_start", on_click=go_start)
 
-    if mode == "group":
+    if start == "group":
+        with header:
+            marquee("Group night", "Host a<br>movie night<em>.</em>",
+                    "Everyone brings a few films, everyone swipes, and one film wins.")
         st.text_input("Your name", key="gh_name", max_chars=24, placeholder="So your friends know who's hosting")
         st.button("Host a movie night", type="primary", width="stretch", on_click=host_group)
-        join_box()
+        how_it_works(group=True)
         st.stop()
 
-    if mode == "own":
-        export_guide()
-        st.text_input("Your name", key="sp_name", placeholder=NAME_HINT, help=NAME_HELP)
+    if start == "own":
+        with header:
+            marquee("Two phones · step 1 of 2", "Bring your<br>films<em>.</em>",
+                    "Upload your Letterboxd export. You'll get a code to send to the other person.")
         st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="sp_file",
                          help=UPLOAD_HELP)
+        export_guide(label="Don't have your export yet?")
+        st.text_input("Your name", key="sp_name", placeholder=NAME_HINT, help=NAME_HELP)
         st.button("Get a pair code", type="primary", width="stretch", on_click=start_pair,
                   disabled=not st.session_state.get("sp_file"))
         if st.session_state.get("sp_error"):
             st.error(st.session_state.sp_error)
-        join_box()
         st.stop()
 
     if not have_both:
-        export_guide()
+        with header:
+            marquee("One phone", "Both of<br>you<em>.</em>", "Upload both Letterboxd exports on this phone.")
     with st.expander("Your Letterboxd exports", expanded=not have_both):
         name_a = st.text_input("First person's name", placeholder=NAME_HINT, help=NAME_HELP)
         file_a = st.file_uploader("First person's export", type=["zip", "csv"],
@@ -3409,8 +3477,9 @@ else:
         name_b = st.text_input("Second person's name", placeholder=NAME_HINT, help=NAME_HELP)
         file_b = st.file_uploader("Second person's export", type=["zip", "csv"],
                                   accept_multiple_files=True, key="file_b", help=UPLOAD_HELP)
+    if not have_both:
+        export_guide(label="Don't have your exports yet?")
     if not (file_a and file_b):
-        join_box()
         st.stop()
     raw_a, raw_b = bundle(file_a), bundle(file_b)
 

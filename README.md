@@ -38,19 +38,21 @@ Go to **[letterboxd.com/settings/data](https://letterboxd.com/settings/data)** a
 
 > The export is only available on the Letterboxd **website**, not in the phone app. On a phone, open the site in your browser.
 >
-> In the app, **"How do I get my Letterboxd export?"** has a button that opens the export page directly, plus an illustrated walkthrough.
+> In the app, **"Don't have your export yet?"** (under the upload box) has a button that opens the export page directly, plus an illustrated walkthrough.
 
 ### 2. Pair up
 
-**Two phones (the default)**
+The start screen asks who's watching.
 
-1. One of you opens the app, uploads your export and taps **Get a pair code**.
+**Two phones**
+
+1. One of you taps **Two phones**, uploads your export and taps **Get a pair code**.
 2. Send the other person the link or the four-letter code.
-3. They open it, upload their own export, and both phones load the full app.
+3. They open the link (or type the code under **Got a code?** on the start screen), upload their own export, and both phones load the full app.
 
 **One phone**
 
-Upload both exports on one phone. You can still start a swipe session from the Swipe tab, and the other person joins it on their phone with the code.
+Tap **One phone** and upload both exports. You can still start a swipe session from the Swipe tab, and the other person joins it on their phone with the code.
 
 ### Group night 🍿
 
