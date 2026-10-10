@@ -26,7 +26,10 @@ There's also a **Group night** mode for more than two people. Everyone brings a 
 
 On top of that:
 
-- **Film details:** each film shows its length and genre, and **where it's streaming** in your country.
+- **Film details:** each film shows its length and genre, **where it's streaming** in your country, and a **▶ Trailer** link.
+- **Your films are remembered:** after your first upload, your films are kept in your phone's browser, so next time you can pair up in one tap. Upload a newer export whenever you like, or forget them in Settings.
+- **Our streaming services:** pick the services you have in Settings, and Pick and Swipe show only films you can stream tonight.
+- **We watched it:** after a pick or a match, tap **We watched it**. The film stops coming up, and it's added to **Your movie nights** at the bottom of the Pick tab.
 - **Settings:** tap **Settings** at the top to pick a background colour (Lavender, Butter, Blush or Periwinkle) or **Dark**, choose minimal poster art or the films' real posters, and set your streaming country. The app goes dark on its own when your phone is in dark mode, unless you switch that off. Your choices are remembered on that phone.
 - **Share:** a **Share** button turns tonight's pick, your match, your taste-match score or the group winner into an image for WhatsApp or Instagram.
 
@@ -59,7 +62,7 @@ Tap **One phone** and upload both exports. You can still start a swipe session f
 Hosting friends? Pick **Group night** on the start screen.
 
 1. The host taps **Host a movie night** and shares the code or link.
-2. Everyone joins on their own phone and brings 5–10 films. Make a Letterboxd list of what you'd watch, export your data (after making the list), then upload the export and pick that list. If two people bring the same film, it only shows up once.
+2. Everyone joins on their own phone and brings 5–10 films. Make a Letterboxd list of what you'd watch, export your data (after making the list), then upload the export and pick that list. If two people bring the same film, it only shows up once. Friends without Letterboxd can tap **Just come to swipe** and vote on everyone else's films.
 3. The host starts the vote and everyone swipes through the combined pile. Everyone gets **one super-like ★**, which counts double.
 4. The film with the most votes wins, and you get a shortlist of the top five. If it's a tie or you want to narrow it down, the host can run a quick run-off on the top few.
 
@@ -73,10 +76,12 @@ Hosting friends? Pick **Group night** on the start screen.
 
 ## Privacy
 
-- Nothing is written to disk or stored in a database.
+- Nothing is written to disk or stored in a database on the server.
+- If you choose to, your own films (the slimmed-down copy described below) and your **movie nights** list are kept in **your phone's browser storage**, never on the server. Forget them any time in Settings, or by clearing your browser's site data.
 - Uploads are held in the app's memory only for your session. When you pair or swipe across two phones, they're kept for up to 12 hours so the other phone can load them. Restarting the app clears everything.
 - Straight after upload, the app throws away everything except your watched films, ratings, watchlist and profile name. Your email address, reviews, comments and diary notes from the export are never kept.
 - To look up film details, only a film's title and year are sent to TMDB. Nothing about you is sent.
+- If the app owner turns on usage counts (below), the app sends anonymous event names such as "match" or "pick" to GoatCounter. No names, films, cookies or anything about you.
 
 ## Film details setup (for whoever runs the app)
 
@@ -93,6 +98,25 @@ Film details, real posters and streaming info come from [TMDB](https://www.themo
 3. Save. The app restarts with film details switched on.
 
 To run it locally with details, put the same line in `.streamlit/secrets.toml`. Never commit that file to GitHub.
+
+## Usage counts (optional, for whoever runs the app)
+
+To see how the app is used (movie nights started, matches made and so on) without collecting anything personal:
+
+1. Make a free account at [goatcounter.com](https://www.goatcounter.com). Pick a code, for example `doublefeature`, which gives you `doublefeature.goatcounter.com`.
+2. In the app's **Settings → Secrets** on share.streamlit.io, add:
+
+   ```toml
+   GOATCOUNTER_CODE = "doublefeature"
+   ```
+
+3. Counts appear on your GoatCounter dashboard as events named `event/open`, `event/pair_started`, `event/paired`, `event/pick`, `event/match`, `event/watched`, `event/group_hosted`, `event/group_joined`, `event/group_result` and `event/start_over`.
+
+Without the secret, nothing is sent. Ad blockers may block the counter, so the numbers are a lower bound.
+
+## Keeping the app awake
+
+Streamlit Community Cloud puts an app to sleep after 12 hours without visitors, and the first person back waits for it to wake up. `.github/workflows/keep-awake.yml` is a GitHub Action that opens the app every 6 hours (and wakes it if it's asleep). It runs on GitHub's free Actions minutes; you can also run it by hand from the repo's **Actions** tab. GitHub pauses scheduled actions after 60 days without any commits to the repo, and emails you when it does.
 
 ## Running it locally
 
@@ -113,7 +137,8 @@ It opens in your browser. To try it on a phone on the same Wi-Fi, use the **Netw
 - **Matching:** films are matched across accounts by title and year. Anything you've rated counts as seen.
 - **Taste match:** 100% minus the average rating gap on films you've both rated, scaled so a full 4.5★ gap would be 0%.
 - **Posters:** the export has no images, so each film gets a generated screen-print-style poster based on its title. Share images redraw the same poster with Pillow.
-- **Film details:** films are looked up on TMDB by title and year. Details are cached in memory for a week, and if TMDB is unreachable the app stops asking for 10 minutes.
+- **Film details:** films are looked up on TMDB by title and year (details, trailers and streaming). Details are cached in memory for a week, and if TMDB is unreachable the app stops asking for 10 minutes.
+- **Remembered films and history:** a small hidden component reads and writes the phone's browser storage (`localStorage`): settings, the slimmed-down export and the movie nights list.
 - **Pairing and swiping:** rooms live in server memory (`st.cache_resource`) under a four-letter code. Both phones check for changes every couple of seconds. The swipe cards are a small custom component (`st.components.v2`) that supports dragging and buttons.
 - **Sharing:** uses the phone's own share sheet where it's available, otherwise the image downloads.
 - **Look and colours:** `.streamlit/config.toml` sets the light base theme. The background colours and dark mode are CSS variables the app swaps in per person, and the choice is saved in the phone's browser storage (nothing is sent anywhere).
@@ -123,6 +148,9 @@ It opens in your browser. To try it on a phone on the same Wi-Fi, use the **Netw
 ```
 ├── app.py
 ├── requirements.txt
+├── .github/
+│   └── workflows/
+│       └── keep-awake.yml
 ├── .streamlit/
 │   └── config.toml
 └── static/
@@ -130,6 +158,9 @@ It opens in your browser. To try it on a phone on the same Wi-Fi, use the **Netw
     ├── bricolage-ext.woff2
     ├── favicon.png
     ├── apple-touch-icon.png
+    ├── icon-192.png
+    ├── icon-512.png
+    ├── manifest.json
     ├── logo.png
     └── share/
         ├── bricolage-500.ttf

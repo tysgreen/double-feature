@@ -173,6 +173,15 @@ a { -webkit-tap-highlight-color: transparent; }
 .mq-brand { font-weight: 800; font-size: 1.15rem; letter-spacing: -.02em; line-height: 2.5rem;
   display: flex; align-items: center; gap: .4rem; }
 .mq-brand .logo { display: block; flex: none; }
+.st-key-go_home { position: absolute !important; top: 0; left: 0; width: 13.5rem !important; height: 2.6rem; z-index: 4; }
+.st-key-go_home button { width: 100%; height: 100%; min-height: 0 !important; opacity: 0; cursor: pointer; }
+.st-key-reset_box { border: 2px solid var(--line); border-radius: 18px; background: var(--surface); padding: 1rem 1.1rem;
+  box-shadow: 3px 3px 0 var(--line); margin: .2rem 0 .8rem; gap: .3rem; }
+.reset-t { font-weight: 800; font-size: 1.25rem; letter-spacing: -.02em; }
+.reset-n { color: var(--muted); font-size: .92rem; font-weight: 500; line-height: 1.4; margin-bottom: .75rem; }
+.st-key-reset_btns { gap: .6rem; }
+.st-key-reset_btns [data-testid="stBaseButton-primary"] { min-height: 2.9rem; }
+.st-key-reset_btns [data-testid="stBaseButton-primary"] p { font-size: 1rem !important; }
 .mq-brand span { color: var(--accent-ink); }
 .mq-kick { margin-top: 1rem; font-weight: 700; letter-spacing: .14em; font-size: .78rem; color: var(--muted);
   text-transform: uppercase; }
@@ -462,34 +471,94 @@ def theme_tokens() -> dict:
     return {**LIGHT, "bg": THEME_BG.get(theme, THEME_BG["lavender"]), "is-dark": "0"}
 
 
+def _secret(name):
+    try:
+        val = st.secrets.get(name)
+    except Exception:  # no secrets file at all
+        val = None
+    return val or os.environ.get(name)
+
+
 PREFS_JS = """
 export default function(component) {
   const { data, setStateValue } = component;
-  const KEY = 'double-feature-prefs';
+  const KEY = 'double-feature-prefs', EXPORT = 'double-feature-export', WATCHED = 'double-feature-watched';
+  const read = (k, dflt) => { try { return JSON.parse(window.localStorage.getItem(k) || 'null') || dflt; } catch (e) { return dflt; } };
+  const write = (k, v) => { try { v === null ? window.localStorage.removeItem(k) : window.localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
   const mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
   const dark = !!(mq && mq.matches);
-  let saved = {};
-  try { saved = JSON.parse(window.localStorage.getItem(KEY) || '{}') || {}; } catch (e) { saved = {}; }
+  const saved = read(KEY, {});
 
-  try {  // the icon a phone uses for "Add to Home Screen"
-    if (!document.querySelector('link[rel="apple-touch-icon"]')) {
-      const l = document.createElement('link');
-      l.rel = 'apple-touch-icon'; l.href = new URL('app/static/apple-touch-icon.png', document.baseURI).href;
-      document.head.appendChild(l);
-    }
-  } catch (e) {}
+  // Icons and the name a phone uses for "Add to Home Screen". On Streamlit Cloud the app runs inside a page
+  // that belongs to the same site, so the links go on that outer page too (when the browser allows it).
+  const icon = (doc, base) => {
+    try {
+      const abs = p => new URL(p, base).href;
+      const put = (rel, href, extra) => {
+        doc.querySelectorAll('link[rel="' + rel + '"]').forEach(l => l.remove());
+        const l = doc.createElement('link'); l.rel = rel; l.href = href;
+        Object.entries(extra || {}).forEach(([k, v]) => l.setAttribute(k, v));
+        doc.head.appendChild(l);
+      };
+      put('apple-touch-icon', abs('app/static/apple-touch-icon.png'));
+      put('icon', abs('app/static/favicon.png'), { type: 'image/png' });
+      put('manifest', abs('app/static/manifest.json'));
+      const meta = (n, c) => { let m = doc.querySelector('meta[name="' + n + '"]');
+        if (!m) { m = doc.createElement('meta'); m.name = n; doc.head.appendChild(m); } m.content = c; };
+      meta('apple-mobile-web-app-title', 'Double Feature');
+      meta('application-name', 'Double Feature');
+      meta('apple-mobile-web-app-capable', 'yes');
+      meta('mobile-web-app-capable', 'yes');
+      meta('theme-color', '#ECE7F7');
+      doc.title = 'Double Feature';
+    } catch (e) {}
+  };
+  if (!window.__dfIcons) {
+    window.__dfIcons = true;
+    icon(document, document.baseURI);
+    try { if (window.top !== window && window.top.document) icon(window.top.document, document.baseURI); } catch (e) {}
+  }
+
+  // Anonymous usage counts (only when the app owner has turned them on)
+  const counts = (data && data.counts) || {};
+  if (counts.site && !window.__dfCounter) {
+    window.__dfCounter = true;
+    const s = document.createElement('script');
+    s.async = true; s.src = 'https://gc.zgo.at/count.js';
+    s.dataset.goatcounter = 'https://' + counts.site + '.goatcounter.com/count';
+    s.dataset.goatcounterSettings = JSON.stringify({ no_onload: true, allow_local: false });
+    document.head.appendChild(s);
+  }
+  const send = (name) => {
+    const go = () => window.goatcounter && window.goatcounter.count &&
+      window.goatcounter.count({ path: 'event/' + name, title: name, event: true });
+    if (window.goatcounter && window.goatcounter.count) go(); else setTimeout(go, 1500);
+  };
+
   const seen = (data && data.seen) || {};
   const cur = (data && data.save) || {};
   if (window.__dfPrefsSid !== seen.sid) {
     // First render for this session (a fresh page, or the app reconnected with a new session): only ask the
-    // app to run again if something actually differs (a saved colour or poster style, or the phone being in
-    // dark mode). Otherwise there's nothing to do, and nothing is saved until the session has been checked.
+    // app to run again if there's something to hand over (a saved colour or poster style, saved films or
+    // a watch history) or the phone is in dark mode. Nothing is saved until the session has been checked.
     window.__dfPrefsSid = seen.sid;
-    const differs = ['theme', 'auto', 'posters'].some(k => saved[k] !== undefined && saved[k] !== cur[k]);
-    if (differs || seen.dark !== dark) setStateValue('env', { dark, saved: differs ? saved : {} });
+    window.__dfPutId = seen.put_id;  // anything queued before this point is already applied
+    const differs = ['theme', 'auto', 'posters', 'services'].some(
+      k => saved[k] !== undefined && JSON.stringify(saved[k]) !== JSON.stringify(cur[k]));
+    const exp = read(EXPORT, null), watched = read(WATCHED, []);
+    if (counts.site) send('open');
+    if (differs || seen.dark !== dark || exp || watched.length)
+      setStateValue('env', { dark, saved: differs ? saved : {}, export: exp, watched });
     return;
   }
   try { if (data && data.save) window.localStorage.setItem(KEY, JSON.stringify(data.save)); } catch (e) {}
+  const put = (data && data.put) || null;
+  if (put && put.id && put.id !== window.__dfPutId) {
+    window.__dfPutId = put.id;
+    if ('export' in put) write(EXPORT, put.export);
+    if ('watched' in put) write(WATCHED, put.watched);
+    if (counts.site) (put.events || []).forEach(send);
+  }
   if (seen.dark !== dark) setStateValue('env', { dark, saved: {} });
 }
 """
@@ -497,28 +566,56 @@ prefs_store = st.components.v2.component("prefs", js=PREFS_JS, isolate_styles=Fa
 
 
 def on_prefs():
-    """The browser told us its saved settings and whether the phone is in dark mode."""
-    env = (st.session_state.get("prefs") or {}).get("env") or {}
-    st.session_state.phone_dark = bool(env.get("dark"))
-    if not st.session_state.get("prefs_loaded"):
-        st.session_state.prefs_loaded = True
+    """The browser told us its saved settings, saved films and watch history, and whether it's in dark mode."""
+    ss = st.session_state
+    env = (ss.get("prefs") or {}).get("env") or {}
+    ss.phone_dark = bool(env.get("dark"))
+    exp = env.get("export")
+    if isinstance(exp, dict) and isinstance(exp.get("raw"), str) and "saved_export" not in ss:
+        ss.saved_export = {"name": " ".join(re.sub(r"[<>\[\]*_`#|~\\{}]", "", str(exp.get("name") or "")).split())[:24] or "You",
+                           "raw": exp["raw"],
+                           "saved": str(exp.get("saved") or "")[:10], "films": int(exp.get("films") or 0)}
+    if isinstance(env.get("watched"), list) and "watched_local" not in ss:
+        ss.watched_local = [w for w in env["watched"] if isinstance(w, dict) and w.get("k")][:500]
+    if not ss.get("prefs_loaded"):
+        ss.prefs_loaded = True
         saved = env.get("saved") or {}
         if saved.get("theme") in COLOUR_THEMES:
-            st.session_state.theme = saved["theme"]
+            ss.theme = saved["theme"]
         if isinstance(saved.get("auto"), bool):
-            st.session_state.auto_dark = saved["auto"]
+            ss.auto_dark = saved["auto"]
         if saved.get("posters") in ("art", "real"):
-            st.session_state.poster_style = saved["posters"]
+            ss.poster_style = saved["posters"]
+        if isinstance(saved.get("services"), list):
+            ss.my_services = [str(x) for x in saved["services"]][:30]
+
+
+def put_in_browser(**items):
+    """Queue something for this phone's browser storage (saved films, watch history). Sent on the next run."""
+    put = st.session_state.setdefault("put", {})
+    put.update(items)
+    put["id"] = secrets.token_hex(4)
+
+
+def count_event(name):
+    """Anonymous usage count (only when GOATCOUNTER_CODE is set). Nothing about the person is sent."""
+    if _secret("GOATCOUNTER_CODE"):
+        put = st.session_state.setdefault("put", {})
+        put.setdefault("events", []).append(name)
+        put["id"] = secrets.token_hex(4)
 
 
 TOKENS = theme_tokens()
 st.markdown("<style>:root{" + ";".join(f"--{k}:{v}" for k, v in TOKENS.items()) + "}</style>",
             unsafe_allow_html=True)
 _ss = st.session_state
+_put = _ss.pop("put", None)  # sent once, then dropped so it isn't re-sent on every run
 prefs_store(key="prefs", on_env_change=on_prefs,
-            data={"seen": {"dark": bool(_ss.get("phone_dark")), "sid": _ss.setdefault("prefs_sid", secrets.token_hex(4))},
+            data={"seen": {"dark": bool(_ss.get("phone_dark")), "sid": _ss.setdefault("prefs_sid", secrets.token_hex(4)),
+                           "put_id": (_put or {}).get("id")},
                   "save": {"theme": _ss.get("theme") or "lavender", "auto": bool(_ss.get("auto_dark")),
-                           "posters": _ss.get("poster_style") or "art"}})
+                           "posters": _ss.get("poster_style") or "art", "services": list(_ss.get("my_services") or [])},
+                  "put": _put, "counts": {"site": _secret("GOATCOUNTER_CODE") or ""}})
 
 COLOURS = {}
 esc = html.escape
@@ -1345,7 +1442,45 @@ def marquee(kicker: str, title: str, sub: str = ""):
        + (f'<div class="mq-kick">{kicker}</div>' if kicker else "")
        + f'<div class="mq-title">{title}</div>'
        + (f'<div class="mq-sub">{sub}</div>' if sub else "") + '</div>')
+    # The logo is also a home button: tapping it starts over (after a quick check if there's anything to lose)
+    st.button("Start over", key="go_home", on_click=tap_logo)
+    if st.session_state.get("confirm_reset"):
+        with st.container(key="reset_box"):
+            md('<div class="reset-t">Start over?</div><div class="reset-n">This ends this movie night on this phone and '
+               'takes you back to the start. Your saved films stay saved.</div>')
+            with st.container(horizontal=True, key="reset_btns"):
+                st.button("Start over", type="primary", key="reset_yes", on_click=reset_app)
+                st.button("Cancel", key="reset_no", on_click=lambda: st.session_state.pop("confirm_reset", None))
     settings_menu()
+
+
+# Settings that belong to the person, not the movie night, so they survive starting over
+KEEP_ON_RESET = {"theme", "auto_dark", "poster_style", "region", "phone_dark", "prefs_loaded", "prefs_sid", "prefs",
+                 "theme_pick", "auto_pick", "saved_export", "watched_local", "my_services", "my_services_pick"}
+
+
+def _something_to_lose():
+    ss = st.session_state
+    return any(ss.get(k) for k in ("file_a", "file_b", "sp_file", "pair", "group", "room", "pair_join", "group_join"))
+
+
+def tap_logo():
+    if _something_to_lose():
+        st.session_state.confirm_reset = True
+    else:
+        reset_app()
+
+
+def reset_app():
+    """Back to the start screen: leave any pair, group or swipe session, and forget the uploads on this phone."""
+    count_event("start_over")
+    unpair()
+    leave_group()
+    leave_room()
+    for k in list(st.session_state.keys()):
+        if k not in KEEP_ON_RESET:
+            del st.session_state[k]
+    st.query_params.clear()
 
 
 # ---------- Tickets ----------
@@ -1375,14 +1510,6 @@ REGIONS = {"GB": "UK", "IE": "Ireland", "US": "USA", "CA": "Canada", "AU": "Aust
            "DE": "Germany", "FR": "France", "ES": "Spain", "IT": "Italy", "NL": "Netherlands", "BE": "Belgium",
            "SE": "Sweden", "DK": "Denmark", "NO": "Norway", "PT": "Portugal", "IN": "India", "JP": "Japan",
            "SG": "Singapore", "ZA": "South Africa"}
-
-
-def _secret(name):
-    try:
-        val = st.secrets.get(name)
-    except Exception:  # no secrets file at all
-        val = None
-    return val or os.environ.get(name)
 
 
 def tmdb_on() -> bool:
@@ -1447,6 +1574,10 @@ def settings_menu():
             ss.auto_pick = bool(ss.get("auto_dark", True))
             st.pills("Colour", list(COLOUR_THEMES), key="theme_pick", format_func=COLOUR_THEMES.get, on_change=_pick_theme)
             st.toggle("Go dark when my phone is in dark mode", key="auto_pick", on_change=_pick_auto)
+            if ss.get("saved_export"):
+                se = ss.saved_export
+                st.caption(f"Saved films on this phone: **{se['name']}** · {saved_label(se)}")
+                st.button("Forget my saved films", key="set_forget", on_click=forget_export)
             if tmdb_on():
                 ss.setdefault("poster_style", "art")
                 st.segmented_control("Posters", ["art", "real"], key="poster_style",
@@ -1454,6 +1585,12 @@ def settings_menu():
                 region = current_region()
                 st.selectbox("Streaming in", list(REGIONS), index=list(REGIONS).index(region),
                              format_func=REGIONS.get, key="region")
+                mine = list(ss.get("my_services") or [])
+                ss.my_services_pick = mine
+                st.multiselect("Our streaming services", sorted(set(SERVICE_CHOICES) | set(mine)), key="my_services_pick",
+                               placeholder="Pick the ones you have",
+                               on_change=lambda: ss.update(my_services=list(ss.get("my_services_pick") or [])),
+                               help="Pick and Swipe can then show only films you can stream tonight.")
 
 
 @st.cache_resource
@@ -1513,6 +1650,12 @@ def _tmdb_get(ctx, path, **params):
     return None
 
 
+# Services offered in Settings ("Our streaming services"); names as the app shows them after _clean_service
+SERVICE_CHOICES = ["Netflix", "Prime Video", "Disney+", "Apple TV+", "MUBI", "BBC iPlayer", "ITVX", "Channel 4",
+                   "NOW", "Paramount+", "Max", "Hulu", "Peacock", "Crunchyroll", "BFI Player", "Curzon Home Cinema",
+                   "Shudder", "Criterion Channel", "Kanopy", "Tubi", "Pluto TV", "Plex", "Sky Go", "Stan", "Crave"]
+
+
 def _clean_service(name: str) -> str:
     for junk in (" Standard with Ads", " with Ads", " Amazon Channel", " Apple TV Channel"):
         name = name.replace(junk, "")
@@ -1526,7 +1669,24 @@ def _fake_info(name, year):
     services = ["Netflix", "Prime Video", "MUBI", "BBC iPlayer", "Disney+", "Apple TV+"]
     stream = [services[(h >> s) % len(services)] for s in (3, 9)][: (h % 3)]
     return {"id": h % 100000, "poster": f"/fake{h % 7}.jpg", "runtime": 80 + h % 100, "genres": [genres[h % 9], genres[(h // 9) % 9]][: 1 + h % 2],
+            "trailer": "M7lc1UVf-VE" if h % 5 else None,
             "providers": {cc: {"stream": sorted(set(stream)), "rent": bool(h % 2), "link": ""} for cc in REGIONS}}
+
+
+def _pick_trailer(videos):
+    """The best YouTube trailer from TMDB's videos: official English trailers first. A YouTube id, or None."""
+    vids = [v for v in (videos or {}).get("results") or []
+            if v.get("site") == "YouTube" and v.get("key") and re.fullmatch(r"[\w-]{6,20}", str(v["key"]))]
+    if not vids:
+        return None
+    best = min(vids, key=lambda v: (v.get("type") != "Trailer", not v.get("official"), v.get("iso_639_1") != "en",
+                                    v.get("type") not in ("Teaser", "Clip")))
+    return best["key"] if best.get("type") in ("Trailer", "Teaser") else None
+
+
+def trailer_url(info):
+    key = (info or {}).get("trailer")
+    return f"https://www.youtube.com/watch?v={key}" if key else ""
 
 
 def _fetch_info(ctx, name, year):
@@ -1565,7 +1725,7 @@ def _fetch_info(ctx, name, year):
         return (not same_title(h), off > 1, -(h.get("vote_count") or 0), off, -(h.get("popularity") or 0))
 
     best = min(hits, key=rank)
-    det = _tmdb_get(ctx, f"/movie/{best['id']}")
+    det = _tmdb_get(ctx, f"/movie/{best['id']}", append_to_response="videos")
     prov = _tmdb_get(ctx, f"/movie/{best['id']}/watch/providers")
     if det is None or prov is None:  # partial failure: don't cache half the details
         return None
@@ -1578,11 +1738,11 @@ def _fetch_info(ctx, name, year):
         names = list(dict.fromkeys(_clean_service(p.get("provider_name", "")) for p in streams if p.get("provider_name")))
         providers[cc] = {"stream": names, "rent": bool(v.get("rent") or v.get("buy")), "link": v.get("link") or ""}
     return {"id": best["id"], "poster": best.get("poster_path") or det.get("poster_path"),
-            "runtime": det.get("runtime") or None,
+            "runtime": det.get("runtime") or None, "trailer": _pick_trailer(det.get("videos")),
             "genres": [g["name"] for g in det.get("genres") or [] if g.get("name")][:3], "providers": providers}
 
 
-DETAIL_VERSION = 3  # bump when the lookup changes, so details cached by older code are fetched again
+DETAIL_VERSION = 4  # bump when the lookup changes, so details cached by older code are fetched again
 
 
 def _detail_key(name, year):
@@ -1689,8 +1849,9 @@ def stream_text(info, region) -> str:
 
 
 def info_lines_html(info, region) -> str:
-    d, s = details_text(info), stream_text(info, region)
-    return (f'<div class="tk-meta">{esc(d)}</div>' if d else "") + (f'<div class="tk-stream">{esc(s)}</div>' if s else "")
+    d, s, t = details_text(info), stream_text(info, region), trailer_url(info)
+    return ((f'<div class="tk-meta">{esc(d)}</div>' if d else "") + (f'<div class="tk-stream">{esc(s)}</div>' if s else "")
+            + (f'<a class="tk-trailer" href="{esc(t)}" target="_blank">▶ Trailer</a>' if t else ""))
 
 
 def attribution():
@@ -2019,6 +2180,24 @@ export default function(component) {
 """
 sharer = st.components.v2.component("share_image", js=SHARE_JS, isolate_styles=False)
 
+INVITE_JS = """
+export default function(component) {
+  const { data, parentElement } = component;
+  let btn = parentElement.querySelector('button.share-btn');
+  if (!btn) { btn = document.createElement('button'); btn.className = 'share-btn'; parentElement.appendChild(btn); }
+  btn.innerHTML = data.label;
+  btn.onclick = async () => {
+    if (navigator.share) {
+      try { await navigator.share({ text: data.text }); return; }
+      catch (e) { if (e && e.name === 'AbortError') return; }
+    }
+    try { await navigator.clipboard.writeText(data.text); btn.innerHTML = data.copied;
+          setTimeout(() => { btn.innerHTML = data.label; }, 2500); } catch (e) {}
+  };
+}
+"""
+inviter = st.components.v2.component("invite", js=INVITE_JS, isolate_styles=False)
+
 ICON_SHARE = ('<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" '
               'stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 8l5-5 5 5M5 13v6a2 2 0 0 0 2 2h10a2 2 '
               '0 0 0 2-2v-6"/></svg>')
@@ -2232,6 +2411,9 @@ def swipe_card(c, cls: str) -> str:
     art = poster_html(c["key"], c["name"], "", None, "xl", link=False)
     uri = c.get("uri")
     lb = (f'<a class="sw-lb" href="{esc(str(uri))}" target="_blank">Letterboxd ↗</a>' if uri else "")
+    if c.get("trailer"):
+        lb = (f'<div class="sw-links"><a class="sw-lb sw-tr" href="{esc(str(c["trailer"]))}" target="_blank">▶ Trailer</a>'
+              f'{lb}</div>')
     meta = f'<div class="sw-meta">{esc(c["meta"])}</div>' if c.get("meta") else ""
     if real_poster_url(c["key"], "xl"):  # real posters: put the title in the caption too
         meta = f'<div class="sw-title">{esc(c["name"])}</div>' + meta
@@ -2282,6 +2464,76 @@ def room_pulse(code, seat, seen):
        f'{esc(other)}</b> {status}</div>')
 
 
+# ---------- "We watched it": a small history kept on this phone, and those films stop coming up ----------
+
+def watched_keys() -> set:
+    keys = {w["k"] for w in st.session_state.get("watched_local") or []}
+    room = get_room(st.session_state.get("pair"), "pair") if st.session_state.get("pair") else None
+    return keys | set((room or {}).get("watched", ()))
+
+
+def mark_watched(k, title, year, with_txt, uri=""):
+    ss = st.session_state
+    hist = [w for w in ss.get("watched_local") or [] if w["k"] != k]
+    hist.insert(0, {"k": k, "t": str(title), "y": str(year or ""), "d": time.strftime("%Y-%m-%d"), "w": with_txt,
+                    "u": str(uri or "")})
+    ss.watched_local = hist[:500]
+    put_in_browser(watched=ss.watched_local)
+    count_event("watched")
+    if ss.get("pair"):
+        with _room_store()["lock"]:
+            room = get_room(ss.pair, "pair")
+            if room is not None:
+                room.setdefault("watched", set()).add(k)
+    ss.just_watched = {"k": k, "t": str(title), "u": str(uri or "")}
+
+
+def undo_watched(k):
+    ss = st.session_state
+    ss.watched_local = [w for w in ss.get("watched_local") or [] if w["k"] != k]
+    put_in_browser(watched=ss.watched_local)
+    if ss.get("pair"):
+        with _room_store()["lock"]:
+            room = get_room(ss.pair, "pair")
+            if room is not None:
+                room.get("watched", set()).discard(k)
+    ss.pop("just_watched", None)
+
+
+def watched_button(k, title, year, with_txt, uri, key):
+    st.button("We watched it", icon=":material/check:", width="stretch", key=key,
+              on_click=mark_watched, args=(k, title, year, with_txt, uri))
+
+
+def just_watched_note(where="pick"):
+    jw = st.session_state.get("just_watched")
+    if not jw:
+        return
+    link = (f' <a href="{esc(jw["u"])}" target="_blank">Log it on Letterboxd ↗</a>' if jw.get("u") else "")
+    md(f'<div class="note"><b>Nice. {esc(jw["t"])} is in your movie nights</b> and won\'t come up again.{link}</div>')
+    st.button("Undo", type="tertiary", key=f"undo_watched_{where}", on_click=undo_watched, args=(jw["k"],))
+
+
+def movie_nights_section():
+    hist = st.session_state.get("watched_local") or []
+    if not hist:
+        return
+    section("Your movie nights", kicker=f"{len(hist)} watched together",
+            note="Films you marked as watched here. They're left out of Pick and Swipe. Kept on this phone only.")
+    rows = []
+    for w in hist[:12]:
+        when = ""
+        try:
+            when = time.strftime("%-d %b %Y", time.strptime(w.get("d", ""), "%Y-%m-%d"))
+        except ValueError:
+            pass
+        title = (f'<a href="{esc(w["u"])}" target="_blank">{esc(w["t"])}</a>' if w.get("u") else esc(w["t"]))
+        sub = " · ".join(x for x in (when, f"with {w['w']}" if w.get("w") else "") if x)
+        rows.append(f'<div class="mn-row"><div class="mn-t">{title}<span class="row-y">{esc(w.get("y", ""))}</span></div>'
+                    f'<div class="mn-s">{esc(sub)}</div></div>')
+    md('<div class="mn">' + "".join(rows) + "</div>")
+
+
 def swipe_view(code, host=False):
     room = room_snapshot(code, "swipe")
     if not room:
@@ -2295,12 +2547,8 @@ def swipe_view(code, host=False):
     prefetch_posters([(c["key"], c["name"], c["year"]) for c in room["deck"]])
 
     if host and len(room["joined"]) < 2:
-        link = f"{st.context.url.split('?')[0]}?room={code}" if st.context.url else ""
-        md(f'<div class="room"><div class="room-k">Room code</div><div class="room-code">{code}</div>'
-           f'<div class="room-n">Open Double Feature on the other phone and enter this code, '
-           f'or send this link:</div></div>')
-        if link:
-            st.code(link, language=None)
+        code_card(code, "On the other phone, open Double Feature and enter this code under Got a code?",
+                  label="Room code", what="swipe session")
 
     if seat not in names:
         section("Who's on this phone?", kicker=f"Room {code}", first=not host)
@@ -2325,11 +2573,22 @@ def swipe_view(code, host=False):
            f'<div class="im-n">{esc(names[0])} and {esc(names[1])} both swiped right. Tonight\'s film is…</div></div>')
         why = esc(c["why"]) + "".join(f'<div class="{cls}">{esc(c[f])}</div>'
                                       for f, cls in (("meta", "tk-meta"), ("stream", "tk-stream")) if c.get(f))
+        if c.get("trailer"):
+            why += f'<a class="tk-trailer" href="{esc(c["trailer"])}" target="_blank">▶ Trailer</a>'
         md(ticket(c["key"], c["name"], c["year"], c["uri"], why, kicker="Matched for tonight"))
         share_button(lambda: share_film_png("It's a match", f"{names[0]} & {names[1]}", c["key"], c["name"], c["year"],
                                     c.get("meta", ""), c.get("stream", ""), real_poster_url(c["key"], "xl")),
                      "double-feature-match.jpg", f"It's a match: {c['name']} 🎬", key=f"share_match_{code}",
                      label="Share the match")
+        if st.session_state.get("counted_match") != (code, match):
+            st.session_state.counted_match = (code, match)
+            count_event("match")
+        jw = st.session_state.get("just_watched")
+        if jw and jw.get("k") == match:
+            just_watched_note("match")
+        else:
+            watched_button(match, c["name"], c["year"], f"{names[0]} & {names[1]}", c.get("uri", ""),
+                           key=f"watched_match_{code}")
         st.button("Keep swiping for another", width="stretch", on_click=keep_swiping, args=(code, match))
         return
 
@@ -2400,6 +2659,11 @@ SWIPE_CSS = """
   display: flex; justify-content: space-between; align-items: flex-end; gap: .6rem;
   background: var(--surface); border-top: 2px solid var(--line); font-size: .86rem; font-weight: 500; color: var(--text); }
 .sw-info b { font-weight: 800; }
+.sw-links { flex: 0 0 auto; display: flex; flex-direction: column; gap: .35rem; align-items: stretch; }
+.sw-tr { background: var(--butter); color: #1F1A17 !important; text-align: center; }
+.tk-trailer { display: inline-block; margin-top: .45rem; font-weight: 800; font-size: .82rem; color: #1F1A17 !important;
+  text-decoration: none !important; border: 2px solid #1F1A17; border-radius: 999px; padding: .15rem .65rem;
+  background: #FFFFFF; }
 .sw-lb { flex: 0 0 auto; font-weight: 800; font-size: .8rem; color: var(--text) !important;
   text-decoration: none !important; padding: .3rem .65rem; border-radius: 999px; border: 2px solid var(--line); }
 .stamp { position: absolute; top: 34%; z-index: 4; font-family: var(--sans); font-size: 2rem; font-weight: 800;
@@ -2443,6 +2707,19 @@ SWIPE_CSS = """
 .st-key-join_row { gap: .6rem; flex-wrap: nowrap !important; }
 .st-key-join_row [data-testid="stElementContainer"]:has([data-testid="stTextInput"]) { flex: 1 1 auto; min-width: 0; }
 .st-key-join_row button { min-width: 6.5rem; min-height: 2.75rem; }
+.saved { border: 2px solid var(--line); border-radius: 20px; background: var(--butter); color: #1F1A17;
+  padding: 1rem 1.2rem; box-shadow: 3px 3px 0 var(--line); margin-bottom: .4rem; }
+.saved-k { font-weight: 700; letter-spacing: .12em; font-size: .72rem; text-transform: uppercase; opacity: .75; }
+.saved-t { font-weight: 800; font-size: 1.6rem; letter-spacing: -.03em; line-height: 1.1; margin-top: .2rem; }
+.saved-n { font-size: .92rem; font-weight: 600; margin-top: .15rem; }
+.st-key-saved_btns { gap: .5rem; align-items: center; }
+.mn { display: grid; gap: 8px; }
+.mn-row { border: 2px solid var(--line); border-radius: 16px; background: var(--surface); padding: .65rem .9rem; }
+.mn-t { font-weight: 800; font-size: 1rem; } .mn-t a { color: var(--text) !important; text-decoration: none; }
+.mn-t .row-y { margin-left: .4rem; }
+.mn-s { color: var(--muted); font-size: .85rem; font-weight: 500; margin-top: .1rem; }
+.note a { color: var(--accent-ink) !important; font-weight: 800; }
+.room-link { color: var(--muted); font-size: .78rem; text-align: center; margin-top: .5rem; word-break: break-all; }
 .start-n { color: var(--muted); font-size: .82rem; text-align: center; margin-top: 1.2rem; }
 /* The three start choices: a whole card is the button (a real, invisible button laid over it) */
 [class*="st-key-pick_"] { position: relative; }
@@ -2566,11 +2843,95 @@ def read_upload(files, typed_name: str, fallback: str):
     return raw, (clean_name(typed_name) or d["name"] or fallback)
 
 
+def saved_raw():
+    """This phone's saved films (from browser storage), or None."""
+    se = st.session_state.get("saved_export")
+    if not se:
+        return None
+    try:
+        raw = base64.b64decode(se["raw"], validate=True)
+    except (ValueError, TypeError, KeyError):
+        return None
+    d = safe_load(raw)
+    return raw if d and d["found"] else None
+
+
+def remember_export(raw, name):
+    """Keep this person's slimmed export in their phone's browser (never on the server), if they want that."""
+    if not st.session_state.get("remember_export", True):
+        return
+    d = safe_load(raw)
+    if not d:
+        return
+    films = len(set(d["watched"]["key"]) | set(d["ratings"]["key"]) | set(d["watchlist"]["key"]))
+    se = {"name": name, "raw": base64.b64encode(raw).decode(), "saved": time.strftime("%Y-%m-%d"), "films": films}
+    st.session_state.saved_export = se
+    put_in_browser(export=se)
+
+
+def forget_export():
+    st.session_state.pop("saved_export", None)
+    st.session_state.pop("use_new_export", None)
+    put_in_browser(export=None)
+
+
+def saved_label(se) -> str:
+    when = ""
+    try:
+        when = time.strftime("%-d %b", time.strptime(se.get("saved", ""), "%Y-%m-%d"))
+    except ValueError:
+        pass
+    bits = [f"{se['films']} films" if se.get("films") else "", f"saved {when}" if when else ""]
+    return " · ".join(b for b in bits if b)
+
+
+def own_upload(file_key, name_key, fallback):
+    """This person's export: their saved films, unless they chose to upload a newer one. (raw, name) or (None, error)."""
+    ss = st.session_state
+    se = ss.get("saved_export")
+    if se and not ss.get("use_new_export"):
+        raw = saved_raw()
+        if raw is None:
+            return None, "Your saved films couldn't be read. Upload your export again."
+        return raw, clean_name(ss.get(name_key, "")) or se["name"] or fallback
+    raw, name = read_upload(ss.get(file_key), ss.get(name_key, ""), fallback)
+    if raw is not None:
+        remember_export(raw, name)
+    return raw, name
+
+
+def saved_films_card(new_key="use_new_export"):
+    """Shown instead of the upload box when this phone has saved films."""
+    se = st.session_state.saved_export
+    md(f'<div class="saved"><div class="saved-k">Your films are saved</div><div class="saved-t">{esc(se["name"])}</div>'
+       f'<div class="saved-n">{esc(saved_label(se))}</div></div>')
+    with st.container(horizontal=True, key="saved_btns"):
+        st.button("Use a newer export", key="saved_new", on_click=lambda: st.session_state.update({new_key: True}))
+        st.button("Forget them", key="saved_forget", type="tertiary", on_click=forget_export)
+
+
+def upload_or_saved(file_key, label="Your Letterboxd export"):
+    """The upload box, or the saved-films card. Returns True when there's something to go on."""
+    ss = st.session_state
+    if ss.get("saved_export") and not ss.get("use_new_export"):
+        saved_films_card()
+        return True
+    st.file_uploader(label, type=["zip", "csv"], accept_multiple_files=True, key=file_key, help=UPLOAD_HELP)
+    st.checkbox("Remember my films on this phone", value=True, key="remember_export",
+                help="Keeps a copy of your films in this phone's browser, so next time you can skip the upload. "
+                     "Nothing is saved on the server.")
+    if ss.get("saved_export"):
+        st.button("Use my saved films instead", type="tertiary", key="saved_back",
+                  on_click=lambda: ss.pop("use_new_export", None))
+    return bool(ss.get(file_key))
+
+
 def start_pair():
-    raw, name = read_upload(st.session_state.get("sp_file"), st.session_state.get("sp_name", ""), "Person 1")
+    raw, name = own_upload("sp_file", "sp_name", "Person 1")
     if raw is None:
         st.session_state.sp_error = name
         return
+    count_event("pair_started")
     st.session_state.sp_error = ""
     st.session_state.pair = create_pair(name, raw)
     st.session_state.me = 0
@@ -2578,7 +2939,7 @@ def start_pair():
 
 
 def finish_pair(code):
-    raw, name = read_upload(st.session_state.get("pj_file"), st.session_state.get("pj_name", ""), "Person 2")
+    raw, name = own_upload("pj_file", "pj_name", "Person 2")
     if raw is None:
         st.session_state.pj_error = name
         return
@@ -2595,6 +2956,7 @@ def finish_pair(code):
             name = f"{name} (2)"
         room["slots"][1] = {"name": name, "raw": raw}
     st.session_state.pj_error = ""
+    count_event("paired")
     st.session_state.pair, st.session_state.me = code, 1
     st.session_state.pop("pair_join", None)
     st.query_params["room"] = code
@@ -2671,12 +3033,19 @@ def pair_pulse(code, seen):
         st.rerun(scope="app")
 
 
-def code_card(code, text, label="Pair code"):
+def code_card(code, text, label="Pair code", what="movie night"):
+    """The code in big letters, plus a Send the invite button (the phone's share sheet, or copy).
+    The message leads with the code: on a phone, a link always opens in the browser, even if Double Feature
+    is on the home screen, so typing the code into the home-screen app is the way to stay in the app."""
     link = f"{st.context.url.split('?')[0]}?room={code}" if st.context.url else ""
     md(f'<div class="room"><div class="room-k">{label}</div><div class="room-code">{code}</div>'
        f'<div class="room-n">{text}</div></div>')
+    msg = (f"Join my {what} on Double Feature 🎬\n\nOpen Double Feature and enter the code {code}"
+           + (f"\n\nOr tap: {link}" if link else ""))
+    inviter(key=f"invite_{code}", data={"text": msg, "label": f"{ICON_SHARE}<span>Send the invite</span>",
+                                        "copied": "<span>Copied. Paste it in a message</span>"})
     if link:
-        st.code(link, language=None)
+        md(f'<div class="room-link">{esc(link)}</div>')
 
 
 UPLOAD_HELP = ("On letterboxd.com (not the phone app) go to Settings → Data → Export your data. "
@@ -2778,7 +3147,10 @@ def start_screen():
     md('<div class="steps3"><div><b>1</b>Export from Letterboxd</div><div><b>2</b>Pair your phones</div>'
        '<div><b>3</b>Swipe till you match</div></div>')
     md('<div class="start-k">Who\'s watching?</div>')
+    se = st.session_state.get("saved_export")
     for key, title, sub, cls in START_CHOICES:
+        if se and key == "own":
+            sub = "Your films are saved, so you'll get a code in one tap."
         with st.container(key=f"pick_{key}"):
             md(f'<div class="choice {cls}"><div><div class="ch-t">{title}</div><div class="ch-s">{sub}</div></div>'
                '<span class="ch-go" aria-hidden="true">→</span></div>')
@@ -2789,7 +3161,8 @@ def start_screen():
         st.button("Join", on_click=join_room)
     if st.session_state.get("join_error"):
         st.caption(st.session_state.join_error)
-    md('<div class="start-n">Your Letterboxd data stays in the app\'s memory for up to 12 hours and is never saved.</div>')
+    md('<div class="start-n">Your Letterboxd data stays in the app\'s memory for up to 12 hours and is never saved '
+       'on the server. If you choose, your own films are remembered in this phone\'s browser.</div>')
 
 
 def how_it_works(pairing=True, group=False):
@@ -3050,6 +3423,7 @@ def leave_group():
 
 
 def host_group():
+    count_event("group_hosted")
     name = clean_name(st.session_state.get("gh_name", "")) or "Host"
     code, mid = create_group(name)
     st.session_state.group, st.session_state.gid = code, mid
@@ -3066,6 +3440,7 @@ def join_group(code):
         st.session_state.gj_error = "That movie night is full or has ended."
         return
     st.session_state.gj_error = ""
+    count_event("group_joined")
     st.session_state.group, st.session_state.gid = code, mid
     st.session_state.pop("group_join", None)
     st.query_params["room"] = code
@@ -3099,7 +3474,7 @@ def group_pulse(code, mid, seen):
     if room["phase"] == "lobby":
         chips = "".join(
             f'<div class="gm"><span class="gm-n">{esc(m["name"])}{" ★" if k == room["host"] else ""}</span>'
-            f'<span class="gm-c">{len(m["films"]) or "no"} film{"s" if len(m["films"]) != 1 else ""}</span></div>'
+            f'<span class="gm-c">{"just swiping" if m.get("swiper") and not m["films"] else (str(len(m["films"]) or "no") + " film" + ("s" if len(m["films"]) != 1 else ""))}</span></div>'
             for k, m in members.items())
         md(f'<div class="sec-k" style="margin-top:1.2rem">Who\'s coming · {len(members)}</div>'
            f'<div class="gms">{chips}</div>')
@@ -3129,8 +3504,8 @@ def group_deck_html(room, todo, infos=None, region="GB", super_used=False):
     def card(k, cls):
         e = room["films"].get(k) or {"key": k, "name": k.split("|")[0], "year": "", "uri": "", "by": []}
         i = infos.get(k)
-        return swipe_card({**e, "why": by_names(room, e), "meta": details_text(i), "stream": stream_text(i, region)},
-                          cls)
+        return swipe_card({**e, "why": by_names(room, e), "meta": details_text(i), "stream": stream_text(i, region),
+                           "trailer": trailer_url(i)}, cls)
     cards = card(todo[0], "top") + (card(todo[1], "next") if len(todo) > 1 else "")
     dis = " disabled" if super_used else ""
     hint = ("Super-like used. Right to watch, left to pass" if super_used
@@ -3142,9 +3517,25 @@ def group_deck_html(room, todo, infos=None, region="GB", super_used=False):
             f'<div class="sw-hint">{hint}</div>')
 
 
+def set_swiper(code, mid, on):
+    """A guest without Letterboxd can come just to swipe on everyone else's films."""
+    with _room_store()["lock"]:
+        room = get_room(code, "group")
+        if room and mid in room["members"]:
+            room["members"][mid]["swiper"] = bool(on)
+
+
 def group_film_picker(code, mid, room):
     """Let this person add their films: a list CSV, a full export (pick a list) or typed titles."""
-    mine = room["members"][mid]["films"]
+    me_ = room["members"][mid]
+    mine = me_["films"]
+    if not mine and me_.get("swiper"):
+        host = room["members"][room["host"]]["name"]
+        section("You're in", kicker="Just swiping", first=True,
+                note=f"You'll swipe on everyone else's films when {esc(host)} starts the vote.")
+        st.button("Actually, I'll add some films", type="tertiary", key="g_unswipe",
+                  on_click=set_swiper, args=(code, mid, False))
+        return
     if mine:
         items = "".join(f'<div class="reel-item">{poster_html(k, room["films"][k]["name"], room["films"][k]["year"], None)}</div>'
                         for k in mine if k in room["films"])
@@ -3157,6 +3548,11 @@ def group_film_picker(code, mid, room):
                 note="Upload your Letterboxd export and pick the list you made for tonight.")
         export_guide(group=True)
         group_film_form(code, mid)
+        if mid != room["host"]:
+            md('<div class="or"><span>No Letterboxd?</span></div>')
+            st.button("Just come to swipe", width="stretch", key="g_swipe_only",
+                      on_click=set_swiper, args=(code, mid, True),
+                      help="Skip adding films and vote on everyone else's.")
 
 
 def group_film_form(code, mid):
@@ -3203,8 +3599,8 @@ def group_view(code, mid):
 
     if room["phase"] == "lobby":
         if is_host:
-            code_card(code, "Send this link to everyone, or have them enter the code in Double Feature "
-                            "under Group night.", label="Room code")
+            code_card(code, "Send everyone the invite. They open Double Feature and enter the code "
+                            "under Got a code?", label="Room code", what="group movie night")
         group_pulse(code, mid, seen)
         group_film_picker(code, mid, room)
 
@@ -3252,6 +3648,15 @@ def group_view(code, mid):
                                         real_poster_url(win["key"], "xl")),
                          "double-feature-movie-night.jpg", f"Tonight's movie night pick: {win['name']} 🍿",
                          key=f"share_group_{code}", label="Share the winner")
+            if st.session_state.get("counted_win") != (code, room["round"]):
+                st.session_state.counted_win = (code, room["round"])
+                count_event("group_result")
+            jw = st.session_state.get("just_watched")
+            if jw and jw.get("k") == win["key"]:
+                just_watched_note("group")
+            else:
+                watched_button(win["key"], win["name"], win["year"], f"{host}'s movie night", win["uri"],
+                               key=f"watched_group_{code}")
         elif tied:
             md(f'<div class="its-match"><div class="im-k">The votes are in</div>'
                f'<div class="im-t">It\'s a <em>tie</em></div>'
@@ -3303,7 +3708,8 @@ def group_join_screen(code):
         st.button("Back", on_click=leave_group)
         return
     host = room["members"][room["host"]]["name"]
-    note(f"<b>{esc(host)} is hosting a movie night.</b> Add your name, bring some films, then everyone votes.")
+    note(f"<b>{esc(host)} is hosting a movie night.</b> Add your name, then bring some films or just come to "
+         "swipe. Everyone votes, and one film wins.")
     st.text_input("Your name", key="gj_name", max_chars=24)
     st.button("Join", type="primary", width="stretch", on_click=join_group, args=(code,), key="gj_go")
     if st.session_state.get("gj_error"):
@@ -3341,7 +3747,9 @@ md(GROUP_CSS)
 
 
 header = st.container(key="hdr")
-have_both = all(st.session_state.get(k) for k in ("file_a", "file_b"))
+# One phone: the first person can be this phone's saved films instead of an upload
+use_saved_a = bool(st.session_state.get("saved_export")) and not st.session_state.get("one_new_a")
+have_both = bool((use_saved_a or st.session_state.get("file_a")) and st.session_state.get("file_b"))
 
 # A shared link (?room=CODE) works once per page load, for pair codes and swipe codes alike
 qp = (st.query_params.get("room") or "").strip().upper()
@@ -3370,8 +3778,8 @@ if pair and not paired:
     with header:
         marquee("Pairing up", f"{esc(pair['slots'][0]['name'])} <em>+</em> …",
                 "Waiting for your plus-one")
-    code_card(pair_code, "Send this link, or have them enter the code in Double Feature. They upload their own "
-                         "export and both phones open up together.")
+    code_card(pair_code, "Send the invite. They open Double Feature, enter the code under Got a code? and add "
+                         "their films, then both phones open up together.")
     md('<div class="sw-status"><span class="live"></span>Waiting for the other person to upload</div>')
     pair_pulse(pair_code, pair_state(pair))
     st.button("Cancel", on_click=unpair)
@@ -3391,13 +3799,15 @@ if not paired and st.session_state.get("pair_join"):
         note("<b>That code has expired.</b> Ask for a new one.")
         st.button("Back", on_click=unpair)
     elif room["slots"][1] is None:
-        note(f"<b>{esc(room['slots'][0]['name'])} wants to pair up.</b> Add your Letterboxd export to join.")
-        export_guide()
-        st.text_input("Your name", key="pj_name", placeholder=NAME_HINT, help=NAME_HELP)
-        st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="pj_file",
-                         help=UPLOAD_HELP)
-        st.button("Pair up", type="primary", width="stretch", on_click=finish_pair, args=(jc,),
-                  disabled=not st.session_state.get("pj_file"))
+        note(f"<b>{esc(room['slots'][0]['name'])} wants to pair up.</b> "
+             + ("Your films are saved on this phone, so just tap Pair up."
+                if st.session_state.get("saved_export") and not st.session_state.get("use_new_export")
+                else "Add your Letterboxd export to join."))
+        ready = upload_or_saved("pj_file")
+        if not (st.session_state.get("saved_export") and not st.session_state.get("use_new_export")):
+            export_guide()
+            st.text_input("Your name", key="pj_name", placeholder=NAME_HINT, help=NAME_HELP)
+        st.button("Pair up", type="primary", width="stretch", on_click=finish_pair, args=(jc,), disabled=not ready)
         if st.session_state.get("pj_error"):
             st.error(st.session_state.pj_error)
         st.button("Cancel", on_click=unpair)
@@ -3436,8 +3846,11 @@ if paired:
 else:
     start = "one" if have_both else st.session_state.get("start")
     if start not in ("own", "one", "group"):
+        se = st.session_state.get("saved_export")
         with header:
-            marquee("", "Movie<br>night<em>?</em>", "Swipe till you match. No more scrolling for an hour.")
+            marquee("", "Movie<br>night<em>?</em>",
+                    f"Welcome back, <b>{esc(se['name'])}</b>. Your films are saved on this phone." if se
+                    else "Swipe till you match. No more scrolling for an hour.")
         start_screen()
         st.stop()
     if not have_both:
@@ -3454,14 +3867,15 @@ else:
 
     if start == "own":
         with header:
+            has_saved = bool(st.session_state.get("saved_export")) and not st.session_state.get("use_new_export")
             marquee("Two phones · step 1 of 2", "Bring your<br>films<em>.</em>",
-                    "Upload your Letterboxd export. You'll get a code to send to the other person.")
-        st.file_uploader("Your Letterboxd export", type=["zip", "csv"], accept_multiple_files=True, key="sp_file",
-                         help=UPLOAD_HELP)
-        export_guide(label="Don't have your export yet?")
-        st.text_input("Your name", key="sp_name", placeholder=NAME_HINT, help=NAME_HELP)
-        st.button("Get a pair code", type="primary", width="stretch", on_click=start_pair,
-                  disabled=not st.session_state.get("sp_file"))
+                    "Your films are saved. Get a code to send to the other person." if has_saved
+                    else "Upload your Letterboxd export. You'll get a code to send to the other person.")
+        ready = upload_or_saved("sp_file")
+        if not (st.session_state.get("saved_export") and not st.session_state.get("use_new_export")):
+            export_guide(label="Don't have your export yet?")
+            st.text_input("Your name", key="sp_name", placeholder=NAME_HINT, help=NAME_HELP)
+        st.button("Get a pair code", type="primary", width="stretch", on_click=start_pair, disabled=not ready)
         if st.session_state.get("sp_error"):
             st.error(st.session_state.sp_error)
         st.stop()
@@ -3470,18 +3884,26 @@ else:
         with header:
             marquee("One phone", "Both of<br>you<em>.</em>", "Upload both Letterboxd exports on this phone.")
     with st.expander("Your Letterboxd exports", expanded=not have_both):
-        name_a = st.text_input("First person's name", placeholder=NAME_HINT, help=NAME_HELP)
-        file_a = st.file_uploader("First person's export", type=["zip", "csv"],
-                                  accept_multiple_files=True, key="file_a", help=UPLOAD_HELP)
+        if use_saved_a:
+            se = st.session_state.saved_export
+            name_a, file_a = se["name"], True
+            md(f'<div class="saved"><div class="saved-k">First person · saved films</div><div class="saved-t">'
+               f'{esc(se["name"])}</div><div class="saved-n">{esc(saved_label(se))}</div></div>')
+            st.button("Upload a different export instead", type="tertiary", key="one_new",
+                      on_click=lambda: st.session_state.update(one_new_a=True))
+        else:
+            name_a = st.text_input("First person's name", key="name_a", placeholder=NAME_HINT, help=NAME_HELP)
+            file_a = st.file_uploader("First person's export", type=["zip", "csv"],
+                                      accept_multiple_files=True, key="file_a", help=UPLOAD_HELP)
         st.divider()
-        name_b = st.text_input("Second person's name", placeholder=NAME_HINT, help=NAME_HELP)
+        name_b = st.text_input("Second person's name", key="name_b", placeholder=NAME_HINT, help=NAME_HELP)
         file_b = st.file_uploader("Second person's export", type=["zip", "csv"],
                                   accept_multiple_files=True, key="file_b", help=UPLOAD_HELP)
     if not have_both:
         export_guide(label="Don't have your exports yet?")
     if not (file_a and file_b):
         st.stop()
-    raw_a, raw_b = bundle(file_a), bundle(file_b)
+    raw_a, raw_b = (saved_raw() if use_saved_a else bundle(file_a)), bundle(file_b)
 
 da, db = safe_load(raw_a), safe_load(raw_b)
 bad = [label for label, d in (("the first person", da), ("the second person", db)) if not d or not d["found"]]
@@ -3519,6 +3941,8 @@ t_pick, t_swipe, t_taste, t_swap, t_stats = st.tabs(["Pick", "Swipe", "Taste", "
 # ---------- Pick ----------
 
 def pick_film(options):
+    st.session_state.pop("just_watched", None)
+    count_event("pick")
     st.session_state.pick = random.choice(options)
     st.session_state.picks = st.session_state.get("picks", 0) + 1
 
@@ -3546,6 +3970,11 @@ with t_pick:
             if pa["ratings"].get(k, 0) >= 4:
                 pool.setdefault(k, (A, pa["ratings"][k]))
 
+    gone = watched_keys()
+    if gone:
+        pool = {k: why for k, why in pool.items() if k not in gone}
+    just_watched_note()
+
     decades = sorted({int(y) // 10 * 10 for y in cat.loc[list(pool), "Year"].dropna()})
     chosen = filters.pills("Decades", decades, selection_mode="multi",
                            format_func=lambda d: f"{str(d)[2:]}s" if d >= 1930 else f"{d}s") if decades else []
@@ -3570,13 +3999,19 @@ with t_pick:
         genres = sorted({g for i in infos.values() for g in i.get("genres", [])})
         want_g = filters.pills("Genre", genres, selection_mode="multi", key="f_genre") if genres else []
         svcs = sorted({x for i in infos.values() for x in services(i, region)})
-        want_s = filters.pills("Streaming on", svcs, selection_mode="multi", key="f_svc") if svcs else []
+        mine = set(st.session_state.get("my_services") or [])
+        only_mine = bool(mine) and filters.toggle("Only films on our services", value=True, key="f_mine",
+                                                  help="Set your services in Settings.")
+        want_s = [] if only_mine else (filters.pills("Streaming on", svcs, selection_mode="multi", key="f_svc")
+                                       if svcs else [])
 
         def keep(k):
             i = infos.get(k) or {}
             if max_len != "any" and i.get("runtime") and i["runtime"] > int(max_len):
                 return False
             if want_g and not set(want_g) & set(i.get("genres", [])):
+                return False
+            if only_mine and k in infos and not mine & set(services(i, region)):
                 return False
             return not want_s or bool(set(want_s) & set(services(i, region)))
 
@@ -3593,7 +4028,7 @@ with t_pick:
         return "<br>".join(bits)
 
     if not pool:
-        note("<b>Nothing in the pool.</b> Open Filters to add films one of you loved, or clear the decades.")
+        note("<b>Nothing in the pool.</b> Open Filters to add films one of you loved, or loosen the filters.")
     else:
         pick = st.session_state.get("pick")
         if pick in pool:
@@ -3606,6 +4041,8 @@ with t_pick:
                                         real_poster_url(pick, "xl")),
                          "double-feature-pick.jpg", f"Tonight's pick: {r['Name']} 🎬", key="share_pick",
                          label="Share tonight's pick")
+            watched_button(pick, r["Name"], year_str(r["Year"]), f"{A} & {B}",
+                           r["Letterboxd URI"] if pd.notna(r["Letterboxd URI"]) else "", key="watched_pick")
         else:
             md(f'<div class="tk-ghost"><b>What are we watching?</b>{len(pool)} films in the hat. '
                f'Let fate decide.</div>')
@@ -3614,6 +4051,7 @@ with t_pick:
 
         section("The pool", kicker=f"{len(pool)} films in the hat")
         poster_wall(sorted(pool, key=lambda k: str(cat.at[k, "Name"]).casefold()), key="all_pool", cap=pool_cap)
+    movie_nights_section()
 
 
 # ---------- Swipe ----------
@@ -3629,7 +4067,8 @@ with t_swipe:
     deck = [{"key": k, "name": str(cat.at[k, "Name"]), "year": year_str(cat.at[k, "Year"]),
              "uri": str(cat.at[k, "Letterboxd URI"]) if pd.notna(cat.at[k, "Letterboxd URI"]) else "",
              "why": reason_plain(why), "meta": details_text(infos.get(k)),
-             "stream": stream_text(infos.get(k), region)} for k, why in pool.items()]
+             "stream": stream_text(infos.get(k), region), "trailer": trailer_url(infos.get(k))}
+            for k, why in pool.items()]
     if paired and sc and get_room(sc, "swipe"):
         seat = [A, B][me]
         if st.session_state.get(f"seat_{sc}") != seat:
